@@ -50,7 +50,11 @@ class DeviceTimer:
                 torch.cuda.synchronize()
                 groups = lgt.read()
                 total = interval.elapsed_time() / 1000.0
-                groups["other"] = max(total - sum(groups.values()), 0.0)
+                from sglang.srt.utils.layer_group_timer import TOP_LEVEL_GROUPS
+
+                groups["other"] = max(
+                    total - sum(groups[g] for g in TOP_LEVEL_GROUPS), 0.0
+                )
                 for reporter in self._group_reporters:
                     reporter(groups=groups, **metadata)
             self._report()

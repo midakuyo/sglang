@@ -17,7 +17,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-GROUPS = ("attn", "mlp", "lm_head")
+# attn_core is the attention *kernel* module nested inside the attention
+# block (RadixAttention); it is reported separately but is a subset of attn,
+# so "other" is computed from the top-level groups only.
+GROUPS = ("attn", "attn_core", "mlp", "lm_head")
+TOP_LEVEL_GROUPS = ("attn", "mlp", "lm_head")
 _LEAF_TO_GROUP = {
     "self_attn": "attn",
     "attn": "attn",
@@ -55,11 +59,14 @@ class LayerGroupTimer:
                 ".layers." not in name or "vision" in name or "audio" in name
             ):
                 continue
-            # Only the outermost match counts (e.g. self_attn wraps a core
-            # module also called attn); named_modules yields parents first.
+            # named_modules yields parents first: a match nested inside a
+            # registered attention block is the attention kernel module.
             if any(name.startswith(r + ".") for r in registered):
-                continue
-            registered.append(name)
+                if group != "attn":
+                    continue
+                group = "attn_core"
+            else:
+                registered.append(name)
             start, end = self._event(), self._event()
             mod.register_forward_pre_hook(lambda m, args, ev=start: ev.record())
             mod.register_forward_hook(lambda m, args, out, ev=end: ev.record())
