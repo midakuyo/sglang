@@ -684,7 +684,16 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    # [PATCH scalar-window] Same as the prefix loop: with a sliding window every
+    # extend tile lying entirely before (q_min - SLIDING_WINDOW_SIZE) is fully
+    # masked, so start the sweep at the first tile that can hold a visible key.
+    # The element-wise window mask below still handles the boundary tile, and
+    # rows that see no key in a tile are covered by the -inf row guard.
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        k_lo_ext = tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0)
+        extend_start = (k_lo_ext // BLOCK_N) * BLOCK_N
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -722,7 +731,9 @@ def _fwd_kernel(
             final_mask &= window_mask
 
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        # [PATCH scalar-window] The window-only case no longer needs the per-tile
+        # reduction: out-of-window tiles were excluded by extend_start above.
+        if USE_CUSTOM_MASK:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
