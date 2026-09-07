@@ -9,8 +9,8 @@ docker run -d --device nvidia.com/gpu=1 -p 8001:8000 --name sgl-dev \
   -v /home/midakuyo/data/models:/models \
   -v /home/midakuyo/sglang/python/sglang:/src/python/sglang:ro \
   -v /home/midakuyo/triton-cache:/root/.cache/sglang \
-  -e SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
-  -e SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 -e SGLANG_DEVICE_TIMER_LAYER_GROUPS=${LG:-0} -e SGLANG_DEVICE_TIMER_LAYER_GROUPS_LOG=${LGLOG:-0} -e SGLANG_PROBE_ATTN_ABLATE=${ABL:-} \
+  -e SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=${FREE:-1} \
+  -e SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 -e SGLANG_DEVICE_TIMER_LAYER_GROUPS=${LG:-0} -e SGLANG_DEVICE_TIMER_LAYER_GROUPS_LOG=${LGLOG:-0} -e SGLANG_PROBE_ATTN_ABLATE=${ABL:-} -e SGLANG_IN_BATCH_PREFIX_HOLD_THRESHOLD=${HOLD:-0} \
   "$IMG" \
   python3 -m sglang.launch_server --model-path "$MODEL" \
   --host 0.0.0.0 --port 8000 --mem-fraction-static 0.8 --trust-remote-code \
