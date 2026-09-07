@@ -35,12 +35,15 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
-# M above which the unpack + CUTLASS int8 path beats the QQQ kernel (CMP 170HX
-# sweep: QQQ wins up to M~24, loses from M~48).
-QQQ_MAX_M = 32
 # Keep a resident per-channel int8 copy of every weight (+28.7 GB for a 31B
 # model) so the large-M path skips the unpack kernel entirely.
 KEEP_INT8 = os.environ.get("SGLANG_W4A8_KEEP_INT8", "0") == "1"
+# M above which the CUTLASS int8 path is used. With a resident int8 copy the
+# crossover is the kernel crossover (CMP 170HX: QQQ wins up to M~24, loses
+# from M~48). Without it the unpack costs ~300 ms per 60-layer forward, which
+# the QQQ kernel's large-M penalty (~0.2 ms/token) only exceeds past ~1.5k
+# tokens, so only genuinely large prefills should pay for the unpack.
+QQQ_MAX_M = int(os.environ.get("SGLANG_W4A8_QQQ_MAX_M", "32" if KEEP_INT8 else "1024"))
 
 _SCRATCH: Dict[Tuple[str, str], torch.Tensor] = {}
 
