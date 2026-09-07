@@ -3744,6 +3744,16 @@ class Scheduler(
             in_batch_hold = self.policy.compute_in_batch_hold(
                 self.waiting_queue, inflight, hold_threshold
             )
+            if in_batch_hold or inflight:
+                logger.info(
+                    "in-batch prefix hold: waiting=%d inflight=%d held=%d "
+                    "(last_batch=%s pending_results=%d)",
+                    len(self.waiting_queue),
+                    len(inflight),
+                    len(in_batch_hold),
+                    last_batch.forward_mode.name if last_batch is not None else None,
+                    len(getattr(self, "result_queue", ())),
+                )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
