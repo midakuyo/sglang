@@ -66,6 +66,23 @@ def block_config(head_dim):
     return _BLOCK_CONFIG.get(head_dim, (DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS))
 
 
+# Query rows (q heads x draft tokens) one stage1 program stacks into its tile.
+# Larger tiles read each KV split fewer times (GQA sharing) but cost registers
+# for the fp32 [rows, Dv] accumulator; 32 rows x 256 dims is comfortable.
+MAX_ROWS_PER_PROG = 32
+
+
+def heads_per_prog(kv_group_num, l_pad, max_rows=MAX_ROWS_PER_PROG):
+    """Largest divisor of kv_group_num (halving while even) whose stacked query
+    tile fits max_rows. Every program then covers q heads that share one KV
+    head, so a split's K/V is streamed once per KV head instead of once per
+    q head."""
+    g = max(1, kv_group_num)
+    while g > 1 and g * l_pad > max_rows:
+        g = g // 2 if g % 2 == 0 else 1
+    return g
+
+
 # ---------------------------------------------------------------------------
 # Adaptive N_SPLITS.
 # ---------------------------------------------------------------------------
@@ -147,6 +164,8 @@ def _verify_prefix_stage1(
     stride_lh,
     stride_ls,
     kv_group_num: tl.constexpr,
+    HEADS_PER_PROG: tl.constexpr,  # q heads per program; divides kv_group_num
+    R_TILE: tl.constexpr,  # pow2 >= HEADS_PER_PROG * L_EXT (query rows per program)
     N_SPLITS: tl.constexpr,
     L_EXT: tl.constexpr,  # padded power-of-2 row tile (>= real l_ext)
     HEAD_DIM: tl.constexpr,
@@ -157,20 +176,30 @@ def _verify_prefix_stage1(
     MIN_BLOCK_KV: tl.constexpr,
     SLIDING_WINDOW_SIZE: tl.constexpr,  # <=0: no window
 ):
+    """One program = (sequence, block of HEADS_PER_PROG q heads sharing one KV
+    head, KV split). The q heads' draft rows are stacked into a single
+    [R_TILE, D] query tile so the split's K/V is streamed from HBM once per KV
+    head instead of once per q head (GQA), while the softmax state stays
+    per-row. Row r of the tile is draft token r % L_EXT of q head
+    head_base + r // L_EXT."""
     cur_batch = tl.program_id(0)
-    cur_head = tl.program_id(1)
+    head_blk = tl.program_id(1)
     split_kv_id = tl.program_id(2)
 
-    cur_kv_head = cur_head // kv_group_num
+    head_base = head_blk * HEADS_PER_PROG
+    cur_kv_head = head_base // kv_group_num
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
-    offs_l = tl.arange(0, L_EXT)
+    offs_r = tl.arange(0, R_TILE)
+    offs_rl = offs_r % L_EXT  # draft row within the sequence
+    offs_rg = offs_r // L_EXT  # q head within this program's block
 
     # real number of draft query tokens for this seq
     cur_q_start = tl.load(qo_indptr + cur_batch)
     l_ext = tl.load(qo_indptr + cur_batch + 1) - cur_q_start
-    mask_l = offs_l < l_ext
+    mask_r = (offs_rg < HEADS_PER_PROG) & (offs_rl < l_ext)
+    offs_rh = head_base + offs_rg  # absolute q head per row
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
@@ -191,20 +220,26 @@ def _verify_prefix_stage1(
         win_lo = tl.maximum(cur_batch_seq_len - SLIDING_WINDOW_SIZE, 0)
         split_kv_start = tl.maximum(split_kv_start, win_lo)
 
-    e_max = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
-    e_sum = tl.zeros([L_EXT], dtype=tl.float32)
-    acc = tl.zeros([L_EXT, BLOCK_DV], dtype=tl.float32)
+    e_max = tl.zeros([R_TILE], dtype=tl.float32) - float("inf")
+    e_sum = tl.zeros([R_TILE], dtype=tl.float32)
+    acc = tl.zeros([R_TILE, BLOCK_DV], dtype=tl.float32)
 
+    offs_lse = (
+        cur_batch * stride_lb
+        + offs_rh * stride_lh
+        + split_kv_id * stride_ls
+        + offs_rl
+    )
     if split_kv_end > split_kv_start:
-        # q tile: [L_EXT, D]
+        # q tile: [R_TILE, D]
         offs_q = (
-            (cur_q_start + offs_l)[:, None] * stride_qbs
-            + cur_head * stride_qh
+            (cur_q_start + offs_rl)[:, None] * stride_qbs
+            + offs_rh[:, None] * stride_qh
             + offs_d[None, :]
         )
         q = tl.load(
             Q + offs_q,
-            mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
+            mask=mask_r[:, None] & (offs_d[None, :] < HEAD_DIM),
             other=0.0,
         )
         q_k = q.to(K_Buffer.dtype.element_ty)
@@ -227,13 +262,13 @@ def _verify_prefix_stage1(
                 mask=(offs_d[:, None] < HEAD_DIM) & n_mask[None, :],
                 other=0.0,
             )
-            qk = tl.dot(q_k, k)  # [L_EXT, BLOCK_N]
+            qk = tl.dot(q_k, k)  # [R_TILE, BLOCK_N]
             qk *= sm_scale * k_scale  # fp8 dequant of prefix K (k_scale==1 if bf16)
             # NO causal mask: the whole prefix is visible to all draft tokens
             # (only a sliding window, if any, hides prefix keys).
             if SLIDING_WINDOW_SIZE > 0:
                 win_mask = offs_n[None, :] >= (
-                    cur_batch_seq_len + offs_l[:, None] - SLIDING_WINDOW_SIZE
+                    cur_batch_seq_len + offs_rl[:, None] - SLIDING_WINDOW_SIZE
                 )
                 qk = tl.where(n_mask[None, :] & win_mask, qk, float("-inf"))
             else:
@@ -266,9 +301,9 @@ def _verify_prefix_stage1(
 
         offs_o = (
             cur_batch * stride_ob
-            + cur_head * stride_oh
+            + offs_rh[:, None] * stride_oh
             + split_kv_id * stride_os
-            + offs_l[:, None] * stride_ol
+            + offs_rl[:, None] * stride_ol
             + offs_dv[None, :]
         )
         if SLIDING_WINDOW_SIZE > 0:
@@ -282,28 +317,15 @@ def _verify_prefix_stage1(
         tl.store(
             Att_Out + offs_o,
             acc / e_sum_safe[:, None],
-            mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+            mask=mask_r[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
-
-        offs_lse = (
-            cur_batch * stride_lb
-            + cur_head * stride_lh
-            + split_kv_id * stride_ls
-            + offs_l
-        )
-        tl.store(Att_Lse + offs_lse, lse, mask=mask_l)
+        tl.store(Att_Lse + offs_lse, lse, mask=mask_r)
     else:
         # split did not run: write a sentinel lse so stage2 can ignore it.
-        offs_lse = (
-            cur_batch * stride_lb
-            + cur_head * stride_lh
-            + split_kv_id * stride_ls
-            + offs_l
-        )
         tl.store(
             Att_Lse + offs_lse,
-            tl.zeros([L_EXT], tl.float32) - float("inf"),
-            mask=mask_l,
+            tl.zeros([R_TILE], tl.float32) - float("inf"),
+            mask=mask_r,
         )
 
 
@@ -480,6 +502,8 @@ class VerifySplitKV:
         self.v_head_dim = v_head_dim
         self.l_ext = l_ext  # real draft tokens per seq (fixed == 4)
         self.l_pad = triton.next_power_of_2(l_ext)
+        self.heads_per_prog = heads_per_prog(self.group, self.l_pad)
+        self.r_tile = triton.next_power_of_2(self.heads_per_prog * self.l_pad)
         self.device = device
         self.n_splits = n_splits
         self.block_n = block_n
@@ -518,7 +542,7 @@ class VerifySplitKV:
         v_scale,
         sliding_window_size=-1,
     ):
-        grid = (bs, self.h_q, self.n_splits)
+        grid = (bs, self.h_q // self.heads_per_prog, self.n_splits)
         _verify_prefix_stage1[grid](
             q_extend,
             k_buffer,
@@ -545,6 +569,8 @@ class VerifySplitKV:
             self.att_lse.stride(1),
             self.att_lse.stride(2),
             kv_group_num=self.group,
+            HEADS_PER_PROG=self.heads_per_prog,
+            R_TILE=self.r_tile,
             N_SPLITS=self.n_splits,
             L_EXT=self.l_pad,
             HEAD_DIM=self.head_dim,
