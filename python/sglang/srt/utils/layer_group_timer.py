@@ -46,6 +46,7 @@ class LayerGroupTimer:
         return torch.cuda.Event(enable_timing=True, external=True)
 
     def install(self, model: torch.nn.Module) -> "LayerGroupTimer":
+        registered: List[str] = []
         for name, mod in model.named_modules():
             group = _LEAF_TO_GROUP.get(name.rsplit(".", 1)[-1])
             if group is None:
@@ -54,6 +55,11 @@ class LayerGroupTimer:
                 ".layers." not in name or "vision" in name or "audio" in name
             ):
                 continue
+            # Only the outermost match counts (e.g. self_attn wraps a core
+            # module also called attn); named_modules yields parents first.
+            if any(name.startswith(r + ".") for r in registered):
+                continue
+            registered.append(name)
             start, end = self._event(), self._event()
             mod.register_forward_pre_hook(lambda m, args, ev=start: ev.record())
             mod.register_forward_hook(lambda m, args, out, ev=end: ev.record())
