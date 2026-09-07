@@ -458,6 +458,12 @@ class Envs:
     SGLANG_TRACE_ASYNC = EnvBool(False)
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    # >0: hold a waiting request out of the prefill batch for one round when it
+    # shares at least this many not-yet-cached prompt tokens with a request that
+    # is being prefilled right now (or ahead of it in the queue), so the
+    # leader's KV lands in the radix tree and followers prefill only their
+    # suffix. Any schedule policy.
+    SGLANG_IN_BATCH_PREFIX_HOLD_THRESHOLD = EnvInt(0)
     # >0: with the device timer, also split every N-th target forward into
     # attn / mlp / lm_head / other GPU seconds (one stream sync per N passes).
     SGLANG_DEVICE_TIMER_LAYER_GROUPS = EnvInt(0)
