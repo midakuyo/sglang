@@ -57,6 +57,12 @@ from sglang.srt.utils import (
 )
 
 _is_cuda = is_cuda()
+
+# [probe] SGLANG_PROBE_ATTN_ABLATE=kvwrite|kernel skips that part of
+# forward_extend for timing ablation. Output is garbage; never use in serving.
+import os as _os
+
+_PROBE_ABLATE = _os.environ.get("SGLANG_PROBE_ATTN_ABLATE", "")
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
@@ -1571,7 +1577,7 @@ class TritonAttnBackend(AttentionBackend):
             raise ValueError("Both k and v should be None or not None")
         else:
             # Save KV cache first (must do this before unified kernel)
-            if save_kv_cache:
+            if save_kv_cache and _PROBE_ABLATE != "kvwrite":
                 loc_info = KVWriteLoc(
                     forward_batch.out_cache_loc,
                     self.forward_metadata.swa_out_cache_loc,
@@ -1692,6 +1698,8 @@ class TritonAttnBackend(AttentionBackend):
         # to extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
+        if _PROBE_ABLATE == "kernel":
+            return o
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
