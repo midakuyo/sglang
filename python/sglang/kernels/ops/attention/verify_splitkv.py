@@ -28,7 +28,8 @@ Two Triton kernels:
 bit-equivalently and returns True, otherwise returns False (doing nothing) so
 the caller falls back to ``extend_attention_fwd``. Supported case: causal
 (topk=1) verify with a constant per-sequence extend length, no sinks /
-sliding-window / logit-cap / xai-temperature. Correctness is never violated.
+logit-cap / xai-temperature; sliding-window prefixes are supported (per-row
+window mask, see ``_verify_prefix_stage1``). Correctness is never violated.
 """
 
 import torch
@@ -40,9 +41,8 @@ from sglang.srt.utils import is_hip
 _MIN_BLOCK_KV = 32
 
 # AMD/CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim); NVIDIA's
-# Triton rejects these kwargs, so only pass them on ROCm. In production this kernel
-# is dispatched only on AMD (see TritonAttnBackend); keeping it NV-safe lets the
-# numerics test run on the CUDA CI lane.
+# Triton rejects these kwargs, so only pass them on ROCm. The kernel is dispatched
+# on AMD gfx95 and on CUDA (see TritonAttnBackend).
 _IS_HIP = is_hip()
 _AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if _IS_HIP else {}
 
@@ -155,6 +155,7 @@ def _verify_prefix_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
+    SLIDING_WINDOW_SIZE: tl.constexpr,  # <=0: no window
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -180,6 +181,15 @@ def _verify_prefix_stage1(
     )
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    if SLIDING_WINDOW_SIZE > 0:
+        # Sliding window, same semantics as extend_attention_fwd's prefix mask:
+        # draft row l (absolute position seq_len + l) sees prefix key n iff
+        # n >= seq_len + l - W. Keys below seq_len - W are invisible to every
+        # row, so clamp the split start there (splits fully below it become
+        # empty and emit the -inf sentinel); the per-row mask in the loop
+        # handles the exact boundary.
+        win_lo = tl.maximum(cur_batch_seq_len - SLIDING_WINDOW_SIZE, 0)
+        split_kv_start = tl.maximum(split_kv_start, win_lo)
 
     e_max = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([L_EXT], dtype=tl.float32)
@@ -219,8 +229,15 @@ def _verify_prefix_stage1(
             )
             qk = tl.dot(q_k, k)  # [L_EXT, BLOCK_N]
             qk *= sm_scale * k_scale  # fp8 dequant of prefix K (k_scale==1 if bf16)
-            # NO causal mask: full prefix is visible to all draft tokens.
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+            # NO causal mask: the whole prefix is visible to all draft tokens
+            # (only a sliding window, if any, hides prefix keys).
+            if SLIDING_WINDOW_SIZE > 0:
+                win_mask = offs_n[None, :] >= (
+                    cur_batch_seq_len + offs_l[:, None] - SLIDING_WINDOW_SIZE
+                )
+                qk = tl.where(n_mask[None, :] & win_mask, qk, float("-inf"))
+            else:
+                qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
             # V block: [BLOCK_N, Dv]
             offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
@@ -231,8 +248,14 @@ def _verify_prefix_stage1(
             )
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            if SLIDING_WINDOW_SIZE > 0:
+                # A row may have seen no visible key yet (window boundary);
+                # keep exp() finite so such a tile contributes exactly 0.
+                n_e_max_safe = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+            else:
+                n_e_max_safe = n_e_max
+            re_scale = tl.exp(e_max - n_e_max_safe)
+            p = tl.exp(qk - n_e_max_safe[:, None])
             acc *= re_scale[:, None]
             acc += tl.dot(p.to(v.dtype), v)
             e_sum = e_sum * re_scale + tl.sum(p, 1)
@@ -248,9 +271,17 @@ def _verify_prefix_stage1(
             + offs_l[:, None] * stride_ol
             + offs_dv[None, :]
         )
+        if SLIDING_WINDOW_SIZE > 0:
+            # Rows with no visible key in this split: write 0 and the -inf
+            # lse sentinel so stage2 ignores them (same as an empty split).
+            e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+            lse = tl.where(e_sum > 0, e_max + tl.log(e_sum_safe), float("-inf"))
+        else:
+            e_sum_safe = e_sum
+            lse = e_max + tl.log(e_sum)
         tl.store(
             Att_Out + offs_o,
-            acc / e_sum[:, None],
+            acc / e_sum_safe[:, None],
             mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         )
 
@@ -260,7 +291,7 @@ def _verify_prefix_stage1(
             + split_kv_id * stride_ls
             + offs_l
         )
-        tl.store(Att_Lse + offs_lse, e_max + tl.log(e_sum), mask=mask_l)
+        tl.store(Att_Lse + offs_lse, lse, mask=mask_l)
     else:
         # split did not run: write a sentinel lse so stage2 can ignore it.
         offs_lse = (
@@ -485,6 +516,7 @@ class VerifySplitKV:
         sm_scale,
         k_scale,
         v_scale,
+        sliding_window_size=-1,
     ):
         grid = (bs, self.h_q, self.n_splits)
         _verify_prefix_stage1[grid](
@@ -521,6 +553,7 @@ class VerifySplitKV:
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,
@@ -579,6 +612,7 @@ class VerifySplitKV:
         o_out=None,
         k_scale=1.0,
         v_scale=1.0,
+        sliding_window_size=-1,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -601,6 +635,7 @@ class VerifySplitKV:
             sm_scale,
             k_scale,
             v_scale,
+            sliding_window_size,
         )
         # 2+3+4. fused combine + draft-draft + merge
         self._run_combine_kernel(
@@ -682,8 +717,15 @@ def can_handle(
     # No exotic features.
     if sinks is not None:
         return False
+    # Sliding window is handled in stage1 (per-row prefix mask + split clamp)
+    # provided the window covers the draft-draft block, so stage2's small
+    # causal block needs no window mask.
     if sliding_window_size is not None and sliding_window_size > 0:
-        return False
+        try:
+            if int(sliding_window_size) < int(max_len_extend):
+                return False
+        except (TypeError, ValueError):
+            return False
     if logit_cap and logit_cap > 0:
         return False
     if xai_temperature_len is not None and xai_temperature_len > 0:
@@ -852,6 +894,11 @@ def verify_splitkv_fwd(
         o_out=o_extend,
         k_scale=k_scale,
         v_scale=v_scale,
+        sliding_window_size=(
+            int(sliding_window_size)
+            if sliding_window_size is not None and sliding_window_size > 0
+            else -1
+        ),
     )
 
     return True

@@ -6,7 +6,8 @@ causal (target-verify) path. These tests check:
       (the operative case at topk=1), across head dims / GQA ratios / prefix
       lengths / extend lengths / KV scales;
   (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
-      (non-causal, sinks, sliding-window, logit-cap, ragged extend), so the
+      (non-causal, sinks, window shorter than the draft block, logit-cap,
+      ragged extend), so the
       backend falls back to ``extend_attention_fwd``.
 
 The topk>1 case is gated off in the backend (TritonAttnBackend enables this path
@@ -93,6 +94,7 @@ class TestVerifySplitKV(CustomTestCase):
         k_scale=1.0,
         v_scale=1.0,
         dtype=torch.bfloat16,
+        sliding_window_size=-1,
     ):
         device = "cuda"
         q, k, v, kb, vb, qo, kvp, kvi, mle = _build_verify_inputs(
@@ -120,6 +122,7 @@ class TestVerifySplitKV(CustomTestCase):
             k_scale,
             v_scale,
             sm_scale=sm_scale,
+            sliding_window_size=sliding_window_size,
         )
 
         o_split = torch.empty_like(o_ref)
@@ -140,6 +143,7 @@ class TestVerifySplitKV(CustomTestCase):
             k_scale,
             v_scale,
             sm_scale=sm_scale,
+            sliding_window_size=sliding_window_size,
         )
         self.assertTrue(ran, "verify_splitkv_fwd must handle the topk=1 causal case")
         torch.testing.assert_close(o_split, o_ref, atol=ATOL, rtol=RTOL)
@@ -170,6 +174,27 @@ class TestVerifySplitKV(CustomTestCase):
         # Exercise the k_scale/v_scale dequant-multiplier path (same multipliers
         # the fp8 KV-cache path applies); both kernels must apply them identically.
         self._run_parity([1024, 2048], k_scale=0.5, v_scale=0.25)
+
+    def test_numerics_sliding_window(self):
+        # Hybrid SWA models (Gemma) hand the kernel the window-clipped prefix
+        # (len <= W) plus sliding_window_size=W; the window mask only bites
+        # once the window is saturated (draft row l loses the first l keys).
+        # Also cover prefixes longer than the window (split-start clamp,
+        # sentinel splits) and windows placed so that some rows have no
+        # visible key inside a straddling split (online-softmax guard).
+        cases = (
+            ([512, 512], 1024, 4),
+            ([1024, 1024, 1024], 1024, 3),
+            ([1024, 768], 1024, 4),
+            ([2048, 4096], 1024, 4),
+            ([1000, 1000], 37, 4),
+            ([1000, 1000], 233, 3),
+        )
+        for prefix_lens, w, l_ext in cases:
+            with self.subTest(prefix_lens=prefix_lens, window=w, l_ext=l_ext):
+                self._run_parity(
+                    prefix_lens, l_ext=l_ext, h_q=32, h_kv=16, sliding_window_size=w
+                )
 
     # --- fallback: can_handle() must reject what the kernel can't serve --------
     # (topk>1 is gated off in the backend, not here -- can_handle never inspects
@@ -218,7 +243,7 @@ class TestVerifySplitKV(CustomTestCase):
                 True,
                 None,
                 mle,
-                sliding_window_size=128,
+                sliding_window_size=mle - 1,  # window must cover the draft block
             )
         )
         self.assertFalse(
