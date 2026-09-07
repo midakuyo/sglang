@@ -382,6 +382,52 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
+    def compute_in_batch_hold(
+        self, waiting_queue: List[Req], inflight_reqs: List[Req], threshold: int
+    ) -> Set[int]:
+        """Request ids to keep out of this prefill round.
+
+        A request is held when its prompt shares >= ``threshold`` tokens that
+        are not yet in the real tree with (a) a request whose prefill forward is
+        in flight (its KV is inserted only when the result is processed, one
+        round later under overlap scheduling) or (b) a request ahead of it in
+        the waiting queue that will be admitted first. Holding them one round
+        turns a burst of same-prefix prompts into one full prefill plus
+        suffix-only prefills. Works for any schedule policy.
+        """
+        hold: Set[int] = set()
+        tree = self.waiting_queue_radix_tree
+        tree.reset()
+
+        def _key(r: Req) -> RadixKey:
+            return RadixKey(
+                token_ids=r.origin_input_ids + r.output_ids,
+                extra_key=r.extra_key,
+                cache_salt=r.cache_salt,
+            )
+
+        def _insert(r: Req):
+            tree.insert(
+                InsertParams(
+                    key=_key(r),
+                    value=torch.empty(
+                        len(r.origin_input_ids) + len(r.output_ids), dtype=torch.bool
+                    ),
+                )
+            )
+
+        for r in inflight_reqs:
+            _insert(r)
+        for r in waiting_queue:
+            match_prefix_for_req(self.tree_cache, r, include_req=True)
+            cached = len(r.prefix_indices)
+            shared = len(tree.match_prefix(MatchPrefixParams(key=_key(r))).device_indices)
+            if shared - cached >= threshold:
+                hold.add(r.rid)
+            else:
+                _insert(r)
+        return hold
+
     @staticmethod
     def _sort_by_longest_prefix(
         waiting_queue: List[Req], temporary_deprioritized: Set[int]
