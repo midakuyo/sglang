@@ -293,6 +293,17 @@ class SchedulerMetricsReporter:
             return
         timer = self.forward_pass_device_timer
         self.scheduler.tp_worker.model_runner.device_timer = timer
+        lgt = getattr(self.scheduler.tp_worker.model_runner, "layer_group_timer", None)
+        if lgt is not None:
+            timer.layer_group_timer = lgt
+            if self.enable_metrics:
+
+                def _group_reporter(groups, category, **_kwargs):
+                    self.metrics_collector.increment_forward_layer_group_seconds(
+                        category, groups
+                    )
+
+                timer.add_group_reporter(_group_reporter)
         if self.scheduler.draft_worker is not None:
             dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
             if dw is not None:

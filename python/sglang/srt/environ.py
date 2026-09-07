@@ -458,6 +458,9 @@ class Envs:
     SGLANG_TRACE_ASYNC = EnvBool(False)
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
+    # >0: with the device timer, also split every N-th target forward into
+    # attn / mlp / lm_head / other GPU seconds (one stream sync per N passes).
+    SGLANG_DEVICE_TIMER_LAYER_GROUPS = EnvInt(0)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)

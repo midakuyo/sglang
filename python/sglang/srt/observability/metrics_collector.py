@@ -919,6 +919,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
+        self.forward_layer_group_seconds_total = Counter(
+            name="sglang:forward_layer_group_seconds_total",
+            documentation=(
+                "GPU time of sampled forward passes split by layer group "
+                "(attn / mlp / lm_head / other). See SGLANG_DEVICE_TIMER_LAYER_GROUPS."
+            ),
+            labelnames=list(labels.keys()) + ["category", "group"],
+        )
+        self.forward_layer_group_samples_total = Counter(
+            name="sglang:forward_layer_group_samples_total",
+            documentation="Forward passes sampled into forward_layer_group_seconds_total.",
+            labelnames=list(labels.keys()) + ["category"],
+        )
         self.scheduler_idle_seconds_total = Counter(
             name="sglang:scheduler_idle_seconds_total",
             documentation=(
@@ -1313,6 +1326,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.prefill_effective_tokens_total.labels(
                     **self.labels, mode=mode
                 ).inc(delta)
+
+    def increment_forward_layer_group_seconds(self, category: str, groups: dict):
+        for group, t in groups.items():
+            self.forward_layer_group_seconds_total.labels(
+                **self.labels, category=category, group=group
+            ).inc(t)
+        self.forward_layer_group_samples_total.labels(
+            **self.labels, category=category
+        ).inc(1)
 
     def increment_forward_execution_seconds(
         self,

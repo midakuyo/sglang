@@ -22,9 +22,15 @@ class DeviceTimer:
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [reporter]
         self._in_wrap = False
+        # Optional per-layer-group split (see layer_group_timer.py).
+        self.layer_group_timer = None
+        self._group_reporters: List[Callable] = []
 
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
+
+    def add_group_reporter(self, reporter: Callable):
+        self._group_reporters.append(reporter)
 
     @contextmanager
     def wrap(self, metadata: Dict):
@@ -39,6 +45,14 @@ class DeviceTimer:
         finally:
             self._in_wrap = False
             interval.end(metadata=metadata)
+            lgt = self.layer_group_timer
+            if lgt is not None and lgt.wants_sample(metadata.get("category")):
+                torch.cuda.synchronize()
+                groups = lgt.read()
+                total = interval.elapsed_time() / 1000.0
+                groups["other"] = max(total - sum(groups.values()), 0.0)
+                for reporter in self._group_reporters:
+                    reporter(groups=groups, **metadata)
             self._report()
 
     def _report(self):

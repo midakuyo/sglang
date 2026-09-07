@@ -1194,6 +1194,14 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        # Layer-group GPU timing hooks; installed before graph capture so the
+        # event records become part of the captured graphs.
+        self.layer_group_timer = None
+        lg_every = envs.SGLANG_DEVICE_TIMER_LAYER_GROUPS.get()
+        if lg_every > 0 and not self.is_draft_worker:
+            from sglang.srt.utils.layer_group_timer import LayerGroupTimer
+
+            self.layer_group_timer = LayerGroupTimer(lg_every).install(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
