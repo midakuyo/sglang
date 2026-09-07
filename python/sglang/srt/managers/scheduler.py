@@ -3726,6 +3726,35 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, running_batch)
 
+        # In-batch prefix hold: keep same-prefix followers out of this round
+        # while their leader's prefill is in flight (see SchedulePolicy).
+        in_batch_hold = set()
+        hold_threshold = envs.SGLANG_IN_BATCH_PREFIX_HOLD_THRESHOLD.get()
+        if hold_threshold > 0 and len(self.waiting_queue) <= 128:
+            inflight = []
+            last_batch = self.last_batch
+            if (
+                last_batch is not None
+                and last_batch.forward_mode.is_extend()
+                and len(getattr(self, "result_queue", ())) > 0
+            ):
+                inflight.extend(r for r in last_batch.reqs if not r.finished())
+            if self.chunked_req is not None:
+                inflight.append(self.chunked_req)
+            in_batch_hold = self.policy.compute_in_batch_hold(
+                self.waiting_queue, inflight, hold_threshold
+            )
+            if in_batch_hold or inflight:
+                logger.info(
+                    "in-batch prefix hold: waiting=%d inflight=%d held=%d "
+                    "(last_batch=%s pending_results=%d)",
+                    len(self.waiting_queue),
+                    len(inflight),
+                    len(in_batch_hold),
+                    last_batch.forward_mode.name if last_batch is not None else None,
+                    len(getattr(self, "result_queue", ())),
+                )
+
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
@@ -3790,6 +3819,8 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                continue
+            if req.rid in in_batch_hold:
                 continue
 
             running_bs = len(running_batch.reqs)
