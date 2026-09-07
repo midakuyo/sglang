@@ -1,9 +1,14 @@
+import logging
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional
 
 import torch
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 def device_timer_ctx(timer: Optional["DeviceTimer"], category: str):
@@ -57,6 +62,20 @@ class DeviceTimer:
                 )
                 for reporter in self._group_reporters:
                     reporter(groups=groups, **metadata)
+                if envs.SGLANG_DEVICE_TIMER_LAYER_GROUPS_LOG.get():
+                    per_layer = lgt.read_per_module("attn_core")
+                    logger.info(
+                        "layer-group sample %s total=%.1fms attn=%.1f attn_core=%.1f "
+                        "mlp=%.1f lm_head=%.1f other=%.1f | attn_core per layer (ms): %s",
+                        metadata.get("category"),
+                        total * 1e3,
+                        groups["attn"] * 1e3,
+                        groups["attn_core"] * 1e3,
+                        groups["mlp"] * 1e3,
+                        groups["lm_head"] * 1e3,
+                        groups["other"] * 1e3,
+                        " ".join(f"{x:.2f}" for x in per_layer),
+                    )
             self._report()
 
     def _report(self):

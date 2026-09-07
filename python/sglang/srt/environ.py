@@ -461,6 +461,7 @@ class Envs:
     # >0: with the device timer, also split every N-th target forward into
     # attn / mlp / lm_head / other GPU seconds (one stream sync per N passes).
     SGLANG_DEVICE_TIMER_LAYER_GROUPS = EnvInt(0)
+    SGLANG_DEVICE_TIMER_LAYER_GROUPS_LOG = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)

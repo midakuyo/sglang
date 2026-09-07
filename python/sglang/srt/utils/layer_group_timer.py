@@ -84,6 +84,16 @@ class LayerGroupTimer:
         self._count += 1
         return self._count % self.sample_every == 0
 
+    def read_per_module(self, group: str) -> List[float]:
+        """Milliseconds per hooked module of one group, in module order."""
+        out = []
+        for start, end in self._pairs.get(group, []):
+            try:
+                out.append(start.elapsed_time(end))
+            except Exception:
+                out.append(float("nan"))
+        return out
+
     def read(self) -> Dict[str, float]:
         """Seconds per group for the most recent forward. Call after a
         torch.cuda.synchronize(); pairs whose module did not run are skipped."""
