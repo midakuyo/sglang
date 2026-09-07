@@ -213,10 +213,10 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
-        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
-        # and is gfx95-only; else fall back to extend_attention_fwd.
+        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1);
+        # enabled on gfx95 and CUDA, else fall back to extend_attention_fwd.
         self.use_verify_splitkv = (
-            is_gfx95_supported()
+            (is_gfx95_supported() or _is_cuda)
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
             and self.topk == 1
         )
@@ -1675,13 +1675,13 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
-        # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
-        # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
-        # returns True if it ran (o written), or False for any case it cannot
-        # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
-        # sliding-window / ragged / topk>1), so we fall through to
-        # extend_attention_fwd below. Correctness is never at risk.
+        # Split-KV EAGLE-verify fast path (Triton; gfx95 and CUDA). On
+        # target-verify (topk=1 causal chain), run the bandwidth-efficient
+        # split-KV kernel instead of the serial-prefix extend kernel.
+        # verify_splitkv_fwd() returns True if it ran (o written), or False for
+        # any case it cannot serve bit-equivalently (its can_handle() gates on
+        # non-causal / sinks / logit-cap / ragged / topk>1), so we fall through
+        # to extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
         if self.use_verify_shared_kv:
