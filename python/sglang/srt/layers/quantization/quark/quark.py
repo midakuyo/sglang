@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A8MXFp4MoE,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
+    QuarkW8A8Int8,
 )
 from sglang.srt.layers.quantization.quark.utils import (
     Nvfp4SourceConfig,
@@ -709,6 +710,29 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
 
+    def _is_int8_w8a8(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        """Quark W8A8-INT8: static symmetric int8 weights (per_channel /
+        per_tensor) with dynamic symmetric int8 activations (per_channel ==
+        per-token, or per_tensor). Static activation scales are matched too
+        and rejected inside the scheme with a clear message."""
+        if weight_quant is None or input_quant is None:
+            return False
+        if weight_quant.get("dtype") != "int8" or input_quant.get("dtype") != "int8":
+            return False
+        if weight_quant.get("is_dynamic"):
+            return False
+        if weight_quant.get("qscheme") not in ("per_tensor", "per_channel"):
+            return False
+        if weight_quant.get("symmetric") is not True:
+            return False
+        if input_quant.get("is_dynamic"):
+            return input_quant.get("qscheme") in ("per_channel", "per_tensor")
+        return input_quant.get("qscheme") == "per_tensor"
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -850,6 +874,10 @@ class QuarkConfig(QuantizationConfig):
             )
             if is_fp8_w8a8_supported:
                 return QuarkW8A8Fp8(weight_config, input_config)
+
+        if self._is_int8_w8a8(weight_config, input_config):
+            self._check_scheme_supported(QuarkW8A8Int8.get_min_capability())
+            return QuarkW8A8Int8(weight_config, input_config)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "

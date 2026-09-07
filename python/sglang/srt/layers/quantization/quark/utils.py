@@ -51,6 +51,18 @@ def should_ignore_layer(
     if layer_name is None:
         return False
 
+    # [PATCH] Clippable wrappers (e.g. the Gemma4 vision tower) expose the real
+    # linear at `<proj>.linear`, and Quark exports list such excludes with that
+    # suffix. The fused-shard expansion below keys on the proj name, so strip
+    # the wrapper suffix from both sides before matching.
+    _wrap = ".linear"
+    if layer_name.endswith(_wrap):
+        layer_name = layer_name[: -len(_wrap)]
+    ignore = [
+        i[: -len(_wrap)] if (not i.startswith("re:") and i.endswith(_wrap)) else i
+        for i in ignore
+    ]
+
     # layer_name = model.layers.0.self_attn.qkv_proj
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
