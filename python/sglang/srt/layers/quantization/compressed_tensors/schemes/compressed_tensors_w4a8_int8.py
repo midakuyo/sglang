@@ -1,0 +1,133 @@
+"""compressed-tensors W4A8-INT8: int4 group-quantised weights (symmetric,
+per-group scale along K) with dynamic per-token int8 activations, served on
+Ampere with the Marlin-QQQ kernel.
+
+Weights are converted at load time to the QQQ two-level format (per-channel
+fp32 scale + fp16 group ratio); the kernel materialises int8 weights
+q8 = round(q4 * ratio) on the fly. Small M (decode / MTP verify) runs the
+QQQ kernel; large M (prefill) unpacks the same q8 into a shared scratch and
+runs the CUTLASS int8_scaled_mm, so both paths use identical numerics.
+"""
+
+from typing import Callable, Dict, Optional, Tuple
+
+import torch
+from torch.nn import Parameter
+
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.marlin_qqq import (
+    MAX_PAR,
+    marlin_qqq_gemm,
+    marlin_qqq_workspace,
+    qqq_pack_from_int4,
+    qqq_unpack_to_int8_triton,
+)
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsLinearScheme,
+)
+from sglang.srt.utils import is_cuda
+
+__all__ = ["CompressedTensorsW4A8Int8"]
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel import int8_scaled_mm
+
+# M above which the unpack + CUTLASS int8 path beats the QQQ kernel (CMP 170HX
+# sweep: QQQ wins up to M~24, loses from M~48).
+QQQ_MAX_M = 32
+
+_SCRATCH: Dict[Tuple[str, str], torch.Tensor] = {}
+
+
+def _scratch(key: str, shape, dtype, device) -> torch.Tensor:
+    k = (key, str(device))
+    t = _SCRATCH.get(k)
+    numel = 1
+    for s in shape:
+        numel *= s
+    if t is None or t.numel() < numel:
+        t = torch.empty(numel, dtype=dtype, device=device)
+        _SCRATCH[k] = t
+    return t[:numel].view(*shape)
+
+
+class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
+    def __init__(self, group_size: int, symmetric: bool = True):
+        assert group_size == 128, "Marlin-QQQ supports group_size 128 only"
+        assert symmetric, "asymmetric int4 weights are not supported"
+        self.group_size = group_size
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 80
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        output_partition_sizes: list[int],
+        input_size_per_partition: int,
+        params_dtype: torch.dtype,
+        weight_loader: Callable,
+        **kwargs,
+    ):
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        assert input_size_per_partition % self.group_size == 0
+        weight = ModelWeightParameter(
+            data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=torch.int8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+        weight_scale = GroupQuantScaleParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.group_size,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        q4 = layer.weight.data  # int8 [N, K], values in [-8, 7]
+        s_g = layer.weight_scale.data  # [N, K/g]
+        N, K = q4.shape
+        B, s_ch_p, s_grp_p, _q8, s_ch, s_grp = qqq_pack_from_int4(q4, s_g, self.group_size)
+        del _q8
+        layer.qqq_size_n = N
+        layer.qqq_size_k = K
+        layer.weight = Parameter(B, requires_grad=False)  # int32 [K/16, 2N]
+        layer.weight_scale = Parameter(s_grp_p, requires_grad=False)  # fp16 [K/g, N] (permuted)
+        layer.qqq_s_ch = Parameter(s_ch_p, requires_grad=False)  # fp32 [1, N] (permuted)
+        layer.qqq_s_ch_plain = Parameter(s_ch.reshape(-1).contiguous(), requires_grad=False)  # fp32 [N]
+        layer.qqq_s_grp_plain = Parameter(s_grp, requires_grad=False)  # fp16 [K/g, N]
+        layer.qqq_workspace = marlin_qqq_workspace(N, q4.device)
+        torch.cuda.empty_cache()
+
+    def apply_weights(
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        N, K = layer.qqq_size_n, layer.qqq_size_k
+        x_2d = x.reshape(-1, K)
+        M = x_2d.shape[0]
+        x_q, x_s = per_token_quant_int8(x_2d)
+        if M <= QQQ_MAX_M:
+            c_tmp = _scratch("qqq_c_tmp", (MAX_PAR * 64, N), torch.int32, x.device)
+            y = marlin_qqq_gemm(
+                x_q, layer.weight, x_s, layer.qqq_s_ch, layer.weight_scale,
+                layer.qqq_workspace, M, N, K, c_tmp=c_tmp,
+            )
+            out = y.to(x.dtype)
+            if bias is not None:
+                out = out + bias
+        else:
+            q8 = _scratch("qqq_q8", (N, K), torch.int8, x.device)
+            qqq_unpack_to_int8_triton(layer.weight, layer.qqq_s_grp_plain, K, N, out=q8)
+            out = int8_scaled_mm(x_q, q8.t(), x_s, layer.qqq_s_ch_plain, out_dtype=x.dtype, bias=bias)
+        return out.reshape(*x.shape[:-1], N)
