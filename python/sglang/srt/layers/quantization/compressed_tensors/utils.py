@@ -29,6 +29,20 @@ def should_ignore_layer(
     if layer_name is None:
         return False
 
+    # Clippable wrappers (e.g. the Gemma4 vision tower) expose the real linear
+    # at `<proj>.linear`, and compressed-tensors exports list such excludes
+    # with that suffix, while SGLang's module names (and the fused-shard
+    # expansion below) use the bare projection name. Strip the wrapper suffix
+    # from both sides so the excludes match; otherwise the encoder MLP/QKV
+    # fall through to the quantized scheme (gptq_marlin_repack: size_n=8608).
+    _wrap = ".linear"
+    if layer_name.endswith(_wrap):
+        layer_name = layer_name[: -len(_wrap)]
+    ignore = [
+        i[: -len(_wrap)] if (not i.startswith("re:") and i.endswith(_wrap)) else i
+        for i in ignore
+    ]
+
     # layer_name = model.layers.0.self_attn.qkv_proj
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
