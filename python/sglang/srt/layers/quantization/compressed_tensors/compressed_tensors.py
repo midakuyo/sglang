@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
+    CompressedTensorsW4A8Int8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
@@ -487,6 +488,27 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_8_bits and is_tensor and weight_quant.symmetric and is_static
 
+    def _is_dynamic_token_w4a8_int(
+        self, weight_quant: BaseModel, input_quant: BaseModel
+    ) -> bool:
+        # int4 group-symmetric weights + dynamic per-token int8 activations
+        # (e.g. llm-compressor W4A8 recipes), served with Marlin-QQQ on CUDA.
+        if weight_quant is None or input_quant is None:
+            return False
+        return (
+            weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 128
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+            and input_quant.num_bits == 8
+            and input_quant.type == QuantizationType.INT
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            and input_quant.dynamic
+            and input_quant.symmetric
+        )
+
     def _is_dynamic_token_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -762,6 +784,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                         is_static_input_scheme=True,
                         input_symmetric=input_quant.symmetric,
                     )
+
+            if _is_cuda and self._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+                self._check_scheme_supported(CompressedTensorsW4A8Int8.get_min_capability())
+                return CompressedTensorsW4A8Int8(
+                    group_size=weight_quant.group_size, symmetric=weight_quant.symmetric
+                )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
                 if not _is_npu:

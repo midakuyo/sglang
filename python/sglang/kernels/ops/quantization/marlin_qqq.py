@@ -156,3 +156,68 @@ def qqq_unpack_to_int8(b_q_weight: torch.Tensor, s_group: torch.Tensor, size_k: 
     q4 = qqq_unpack_to_int4(b_q_weight, size_k, size_n)  # [K, N]
     q8 = torch.round((q4.half() * s_group.repeat_interleave(group_size, dim=0)).float()).clamp(-128, 127)
     return q8.to(torch.int8).t().contiguous()  # [N, K]
+
+
+# ---- Triton unpack (int4 QQQ tiles -> per-channel int8 [N, K]) ---------------
+
+import triton
+import triton.language as tl
+from triton.language.extra import libdevice
+
+
+@triton.jit
+def _qqq_unpack_kernel(
+    b_ptr,  # int32 [K/16, 2N]
+    inv_ptr,  # int32 [1024]  logical position -> packed position within a block
+    s_ptr,  # fp16 [K/G, N]
+    out_ptr,  # int8 [N, K]
+    N,
+    K,
+    stride_bk,  # = 2N
+    stride_sk,  # = N
+    GROUP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+    n = offs_n[:, None]
+    k = offs_k[None, :]
+    r = k // 16
+    kk = k % 16
+    ntile = n // 16
+    nn = n % 16
+    blk = ntile // 4
+    s = (ntile % 4) * 256 + kk * 16 + nn  # logical position inside the 1024 block
+    t = tl.load(inv_ptr + s)  # packed position
+    col = blk * 128 + t // 8
+    nib = t % 8
+    packed = tl.load(b_ptr + r * stride_bk + col, mask=mask, other=0)
+    q4 = ((packed >> (nib * 4)) & 0xF) - 8
+    sc = tl.load(s_ptr + (k // GROUP) * stride_sk + n, mask=mask, other=0.0)
+    q8 = libdevice.rint((q4.to(tl.float16) * sc).to(tl.float32))
+    q8 = tl.minimum(tl.maximum(q8, -128.0), 127.0)
+    tl.store(out_ptr + n * K + k, q8.to(tl.int8), mask=mask)
+
+
+def qqq_unpack_to_int8_triton(
+    b_q_weight: torch.Tensor,
+    s_group: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    out: Optional[torch.Tensor] = None,
+    group_size: int = GROUP_SIZE,
+) -> torch.Tensor:
+    """Same result as qqq_unpack_to_int8 (int8 [N, K]), in one gather kernel."""
+    if out is None:
+        out = torch.empty((size_n, size_k), dtype=torch.int8, device=b_q_weight.device)
+    inv = _qqq_inverse_index(str(b_q_weight.device)).to(torch.int32)
+    grid = (triton.cdiv(size_n, 64), triton.cdiv(size_k, 128))
+    _qqq_unpack_kernel[grid](
+        b_q_weight, inv, s_group, out, size_n, size_k, b_q_weight.stride(0), s_group.stride(0),
+        GROUP=group_size, BLOCK_N=64, BLOCK_K=128, num_warps=4,
+    )
+    return out
