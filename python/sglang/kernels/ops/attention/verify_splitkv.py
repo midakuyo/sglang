@@ -61,6 +61,13 @@ _BLOCK_CONFIG = {
 }
 
 
+# Software-pipelining depth of the stage1 KV loop (Triton num_stages). CDNA
+# was validated at 1; on NVIDIA the loop is a chain of dependent gathers, and
+# 3 stages (cp.async prefetch) lifts CMP 170HX bs8/16 by 20-26% (sweep in
+# commit message), bringing the SWA window case to ~90% of HBM bandwidth.
+STAGE1_NUM_STAGES = 1 if _IS_HIP else 3
+
+
 def block_config(head_dim):
     """Return (BLOCK_N, num_warps) for a head_dim; default for untuned dims."""
     return _BLOCK_CONFIG.get(head_dim, (DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS))
@@ -581,7 +588,7 @@ class VerifySplitKV:
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
             SLIDING_WINDOW_SIZE=sliding_window_size,
             num_warps=self.num_warps,
-            num_stages=1,
+            num_stages=STAGE1_NUM_STAGES,
             **_AMD_LAUNCH_KWARGS,
         )
 
