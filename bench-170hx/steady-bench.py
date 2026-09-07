@@ -4,11 +4,11 @@
 # 사용: steady-bench.py <base_url> <K> [max_tokens=160]
 import json, sys, time, threading, urllib.request
 URL = sys.argv[1].rstrip("/") + "/chat/completions"
-K = int(sys.argv[2]); MT = int(sys.argv[3]) if len(sys.argv) > 3 else 160
+K = int(sys.argv[2]); MT = int(sys.argv[3]) if len(sys.argv) > 3 else 160; SALT = sys.argv[4] if len(sys.argv) > 4 else ""
 base = json.load(open("/home/midakuyo/miru.json"))
 res = [None] * K
 def one(k):
-    msgs = base["messages"][:-1] + [{"role": "user", "content": base["messages"][-1]["content"] + f" ({k})"}]
+    msgs = base["messages"][:-1] + [{"role": "user", "content": base["messages"][-1]["content"] + f" ({k}{SALT})"}]
     b = {"model": "x", "messages": msgs, "max_tokens": MT, "temperature": 0, "ignore_eos": True,
          "stream": True, "stream_options": {"include_usage": True}}
     req = urllib.request.Request(URL, json.dumps(b, ensure_ascii=False).encode(), {"Content-Type": "application/json"})
