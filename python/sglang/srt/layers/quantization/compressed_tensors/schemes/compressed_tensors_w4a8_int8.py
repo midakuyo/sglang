@@ -60,6 +60,83 @@ def _scratch(key: str, shape, dtype, device) -> torch.Tensor:
     return t[:numel].view(*shape)
 
 
+class _UnpackPrefetcher:
+    """Overlaps the int4->int8 unpack of the *next* linear with the CUTLASS
+    GEMM of the current one on a side stream (prefill is compute bound, the
+    unpack is memory bound). The call order of W4A8 layers is recorded during
+    the first large-M forward and reused afterwards; two scratch buffers
+    alternate so the side stream never writes the buffer the main stream is
+    reading. Only used outside CUDA graphs (prefill)."""
+
+    def __init__(self):
+        self.stream: Optional[torch.cuda.Stream] = None
+        self.order: list = []  # layer objects in call order (first forward)
+        self.recording = True
+        self.pos = -1
+        self.bufs = [None, None]
+        self.cur = 0
+        self.ready: Dict[int, Tuple[torch.Tensor, torch.cuda.Event]] = {}
+        self.main_done: Optional[torch.cuda.Event] = None
+
+    def _buf(self, i, N, K, device):
+        need = N * K
+        if self.bufs[i] is None or self.bufs[i].numel() < need:
+            self.bufs[i] = torch.empty(need, dtype=torch.int8, device=device)
+        return self.bufs[i][:need].view(N, K)
+
+    def get(self, layer, device) -> torch.Tensor:
+        N, K = layer.qqq_size_n, layer.qqq_size_k
+        main = torch.cuda.current_stream(device)
+        if self.recording:
+            if self.order and layer is self.order[0]:
+                self.recording = False  # a second forward started: order is complete
+                self.pos = -1
+            else:
+                self.order.append(layer)
+        if not self.recording:
+            if self.pos + 1 < len(self.order) and self.order[self.pos + 1] is layer:
+                self.pos += 1
+            else:
+                try:
+                    self.pos = self.order.index(layer)
+                except ValueError:
+                    self.pos = -1
+        entry = self.ready.pop(id(layer), None)
+        if entry is not None:
+            q8, ev = entry
+            main.wait_event(ev)
+        else:
+            q8 = self._buf(self.cur, N, K, device)
+            qqq_unpack_to_int8_triton(layer.weight, layer.qqq_s_grp_plain, K, N, out=q8)
+        # Fence: the side stream may only overwrite the other buffer once the
+        # GEMM that read it (previous layer, main stream) has been issued.
+        self.main_done = torch.cuda.Event()
+        # Prefetch the next layer in recorded order.
+        if not self.recording and 0 <= self.pos < len(self.order) - 1:
+            nxt = self.order[self.pos + 1]
+            if id(nxt) not in self.ready:
+                if self.stream is None:
+                    self.stream = torch.cuda.Stream(device)
+                self.cur ^= 1
+                nb = self._buf(self.cur, nxt.qqq_size_n, nxt.qqq_size_k, device)
+                # wait for everything issued so far on main (incl. the previous
+                # GEMM that read this buffer) before overwriting it
+                self.main_done.record(main)
+                self.stream.wait_event(self.main_done)
+                with torch.cuda.stream(self.stream):
+                    qqq_unpack_to_int8_triton(nxt.weight, nxt.qqq_s_grp_plain, nxt.qqq_size_k, nxt.qqq_size_n, out=nb)
+                    ev = torch.cuda.Event()
+                    ev.record(self.stream)
+                self.ready[id(nxt)] = (nb, ev)
+        return q8
+
+
+_PREFETCH = _UnpackPrefetcher()
+# Off by default: the unpack kernel fills the GPU, so it does not overlap with
+# the CUTLASS GEMM in practice (no gain measured on CMP 170HX).
+PREFETCH_UNPACK = os.environ.get("SGLANG_W4A8_PREFETCH_UNPACK", "0") == "1"
+
+
 class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
     def __init__(self, group_size: int, symmetric: bool = True):
         assert group_size == 128, "Marlin-QQQ supports group_size 128 only"
@@ -119,6 +196,11 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         layer.qqq_s_ch_plain = Parameter(s_ch.reshape(-1).contiguous(), requires_grad=False)  # fp32 [N]
         layer.qqq_s_grp_plain = Parameter(s_grp, requires_grad=False)  # fp16 [K/g, N]
         layer.qqq_workspace = marlin_qqq_workspace(N, q4.device)
+        # Linear layers are post-processed in module order, which is also the
+        # forward call order for a decoder stack; seed the prefetch order so
+        # the very first prefill already overlaps its unpacks.
+        _PREFETCH.order.append(layer)
+        _PREFETCH.recording = False
         torch.cuda.empty_cache()
 
     def apply_weights(
@@ -140,7 +222,10 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         else:
             q8 = layer.qqq_q8
             if q8 is None:
-                q8 = _scratch("qqq_q8", (N, K), torch.int8, x.device)
-                qqq_unpack_to_int8_triton(layer.weight, layer.qqq_s_grp_plain, K, N, out=q8)
+                if PREFETCH_UNPACK and not torch.cuda.is_current_stream_capturing():
+                    q8 = _PREFETCH.get(layer, x.device)
+                else:
+                    q8 = _scratch("qqq_q8", (N, K), torch.int8, x.device)
+                    qqq_unpack_to_int8_triton(layer.weight, layer.qqq_s_grp_plain, K, N, out=q8)
             out = int8_scaled_mm(x_q, q8.t(), x_s, layer.qqq_s_ch_plain, out_dtype=x.dtype, bias=bias)
         return out.reshape(*x.shape[:-1], N)
