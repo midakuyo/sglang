@@ -9,6 +9,7 @@ QQQ kernel; large M (prefill) unpacks the same q8 into a shared scratch and
 runs the CUTLASS int8_scaled_mm, so both paths use identical numerics.
 """
 
+import os
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
@@ -37,6 +38,9 @@ if _is_cuda:
 # M above which the unpack + CUTLASS int8 path beats the QQQ kernel (CMP 170HX
 # sweep: QQQ wins up to M~24, loses from M~48).
 QQQ_MAX_M = 32
+# Keep a resident per-channel int8 copy of every weight (+28.7 GB for a 31B
+# model) so the large-M path skips the unpack kernel entirely.
+KEEP_INT8 = os.environ.get("SGLANG_W4A8_KEEP_INT8", "0") == "1"
 
 _SCRATCH: Dict[Tuple[str, str], torch.Tensor] = {}
 
@@ -98,8 +102,12 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         q4 = layer.weight.data  # int8 [N, K], values in [-8, 7]
         s_g = layer.weight_scale.data  # [N, K/g]
         N, K = q4.shape
-        B, s_ch_p, s_grp_p, _q8, s_ch, s_grp = qqq_pack_from_int4(q4, s_g, self.group_size)
-        del _q8
+        B, s_ch_p, s_grp_p, q8, s_ch, s_grp = qqq_pack_from_int4(q4, s_g, self.group_size)
+        if KEEP_INT8:
+            layer.qqq_q8 = Parameter(q8.t().contiguous(), requires_grad=False)  # int8 [N, K]
+        else:
+            layer.qqq_q8 = None
+        del q8
         layer.qqq_size_n = N
         layer.qqq_size_k = K
         layer.weight = Parameter(B, requires_grad=False)  # int32 [K/16, 2N]
@@ -127,7 +135,9 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
             if bias is not None:
                 out = out + bias
         else:
-            q8 = _scratch("qqq_q8", (N, K), torch.int8, x.device)
-            qqq_unpack_to_int8_triton(layer.weight, layer.qqq_s_grp_plain, K, N, out=q8)
+            q8 = layer.qqq_q8
+            if q8 is None:
+                q8 = _scratch("qqq_q8", (N, K), torch.int8, x.device)
+                qqq_unpack_to_int8_triton(layer.weight, layer.qqq_s_grp_plain, K, N, out=q8)
             out = int8_scaled_mm(x_q, q8.t(), x_s, layer.qqq_s_ch_plain, out_dtype=x.dtype, bias=bias)
         return out.reshape(*x.shape[:-1], N)
