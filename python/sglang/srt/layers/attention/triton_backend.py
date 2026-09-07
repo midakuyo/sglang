@@ -1700,10 +1700,19 @@ class TritonAttnBackend(AttentionBackend):
         # per-head split-KV kernel.
         if _PROBE_ABLATE == "kernel":
             return o
+        verify_extra = {}
         if self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
+            # Host-side average prefix length for the split count (kv_indices
+            # is a max-size scratch buffer inside a captured graph).
+            seq_lens_sum = getattr(forward_batch, "seq_lens_sum", None)
+            if seq_lens_sum is not None and forward_batch.batch_size:
+                hint = seq_lens_sum / forward_batch.batch_size
+                if sliding_window_size > 0:
+                    hint = min(hint, sliding_window_size)
+                verify_extra["kv_len_hint"] = hint
         else:
             verify_fwd = None
         if (
@@ -1733,6 +1742,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=window_kv_offsets,
                 xai_temperature_len=layer.xai_temperature_len,
                 max_bs=self.req_to_token_pool.size,
+                **verify_extra,
             )
         ):
             return o

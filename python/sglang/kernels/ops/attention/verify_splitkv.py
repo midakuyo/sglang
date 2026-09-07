@@ -839,6 +839,7 @@ def verify_splitkv_fwd(
     window_kv_offsets=None,
     xai_temperature_len=-1,
     max_bs=None,
+    kv_len_hint=None,
 ):
     """Drop-in for extend_attention_fwd on the EAGLE target-verify (topk=1)
     shape. Returns True if it ran (o_extend written), False if the case is
@@ -897,7 +898,15 @@ def verify_splitkv_fwd(
     # logic still clamps each split's [start,end) to that seq's real length, so
     # mixed-length batches stay correct -- shorter seqs simply write fewer
     # active splits (the rest emit the -inf lse sentinel, ignored in stage2).
-    avg_seqlen = kv_indices.shape[0] / max(1, bs)
+    # Under CUDA/HIP-graph capture kv_indices is the runner's max-size scratch
+    # buffer, so its length says nothing about the real prefix; callers that
+    # know the host-side average prefix length pass it as kv_len_hint (the
+    # grid is baked into the graph either way, so this only has to be a
+    # sensible static choice).
+    if kv_len_hint is not None:
+        avg_seqlen = kv_len_hint
+    else:
+        avg_seqlen = kv_indices.shape[0] / max(1, bs)
     n_splits = choose_n_splits(avg_seqlen)
 
     # Size scratch by the stable max_bs (backend passes req_to_token_pool size);
