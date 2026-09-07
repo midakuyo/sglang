@@ -492,7 +492,17 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N_PREFIX):
+    # [PATCH scalar-window] Sliding window: every prefix tile lying entirely
+    # before (q_min - SLIDING_WINDOW_SIZE) is fully masked, so start the sweep at
+    # the first tile that can hold a visible key instead of visiting all tiles and
+    # deciding per tile with a [BLOCK_M, BLOCK_N] reduction. The element-wise
+    # window mask below still handles the boundary tile exactly.
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        q_min_pos = cur_seq_len_prefix + cur_block_m * BLOCK_M
+        k_lo = tl.maximum(q_min_pos - SLIDING_WINDOW_SIZE, 0)
+        prefix_start = (k_lo // BLOCK_N_PREFIX) * BLOCK_N_PREFIX
+    for start_n in range(prefix_start, prefix_end, BLOCK_N_PREFIX):
         start_n = tl.multiple_of(start_n, BLOCK_N_PREFIX)
         mask_n = (start_n + offs_n_prefix) < cur_seq_len_prefix
 
@@ -519,7 +529,9 @@ def _fwd_kernel(
             final_mask &= window_mask
 
         SKIP_TILE = False
-        if (USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK) or SLIDING_WINDOW_SIZE > 0:
+        # [PATCH scalar-window] The window-only case no longer needs the per-tile
+        # reduction: out-of-window tiles were excluded by prefix_start above.
+        if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
