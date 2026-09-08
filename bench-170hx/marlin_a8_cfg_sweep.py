@@ -11,6 +11,7 @@ SHAPES = [("qkv", 16384, 5376), ("o", 5376, 8192), ("gate_up", 43008, 5376), ("d
 MS = [int(v) for v in os.environ.get("MS", "1,4,8,12,16,24,32,48,64").split(",")]
 REPS = int(os.environ.get("REPS", "5"))  # min of REPS graph measurements (clock noise)
 A16 = os.environ.get("DTYPE", "int8") == "bf16"  # bf16 activations (W4A16 path) instead of int8
+GROUP = int(os.environ.get("GROUP", "128"))  # weight group size (32 for Google QAT checkpoints)
 CFGS = os.environ.get("CFGS", "auto 128,128,256,1 128,128,256,2 64,256,256,1 64,256,256,2 64,128,128,1 64,128,128,2").split()
 sms = torch.cuda.get_device_properties(0).multi_processor_count
 
@@ -36,18 +37,18 @@ def timeit(fn):
         best = min(best, e0.elapsed_time(e1) / 150)
     return best
 
-print(f"dtype={'bf16 (W4A16)' if A16 else 'int8 (W4A8)'} ms per call, graph replay, min of REPS; columns = cfg (thread_k,thread_n,threads,blocks_per_sm); nr = use_fp32_reduce=False")
+print(f"dtype={'bf16 (W4A16)' if A16 else 'int8 (W4A8)'} group={GROUP} ms per call, graph replay, min of REPS; columns = cfg (thread_k,thread_n,threads,blocks_per_sm); nr = use_fp32_reduce=False")
 hdr = f"{'layer':8s} {'M':>4s} | " + " ".join(f"{c:>12s}" for c in CFGS) + " | auto_nr"
 print(hdr)
 for name, N, K in SHAPES:
     q4 = torch.randint(-8, 8, (N, K), dtype=torch.int8, device=dev)
-    s_g = (torch.rand(N, K // 128, device=dev) * 0.02 + 0.002).to(torch.bfloat16)
+    s_g = (torch.rand(N, K // GROUP, device=dev) * 0.02 + 0.002).to(torch.bfloat16)
     packed = pack_rows_uint4((q4.to(torch.int32) + 8).t().contiguous())
     B = gptq_marlin_repack(packed, torch.empty(0, dtype=torch.int, device=dev), K, N, 4, is_a_8bit=not A16)
     if A16:
-        s16 = marlin_permute_scales(s_g.t().contiguous(), K, N, 128, is_a_8bit=False); factor = torch.ones((), device=dev)
+        s16 = marlin_permute_scales(s_g.t().contiguous(), K, N, GROUP, is_a_8bit=False); factor = torch.ones((), device=dev)
     else:
-        s16, factor = marlin_act_int8_process_scales(marlin_permute_scales(s_g.t().contiguous(), K, N, 128, is_a_8bit=True))
+        s16, factor = marlin_act_int8_process_scales(marlin_permute_scales(s_g.t().contiguous(), K, N, GROUP, is_a_8bit=True))
     del packed
     ws = marlin_make_workspace(dev, max_blocks_per_sm=4)  # forced blocks_per_sm>1 needs sms*bps lock slots
     c_tmp = torch.empty(sms * 64 * 256, dtype=torch.float32, device=dev)

@@ -23,6 +23,10 @@ from torch.nn import Parameter
 from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
 from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.marlin_a8_unpack import (
+    a8_channel_scales,
+    marlin_a8_unpack_to_int8,
+)
 from sglang.kernels.ops.quantization.marlin_qqq import (
     MAX_PAR,
     marlin_qqq_gemm,
@@ -57,6 +61,11 @@ W4A8_KERNEL = os.environ.get("SGLANG_W4A8_KERNEL", "marlin")
 assert W4A8_KERNEL in ("marlin", "qqq"), W4A8_KERNEL
 # fp32 reduce scratch of the Marlin kernel: sms * max_m_block(64) * max_thread_n(256)
 _MARLIN_C_TMP_PER_SM = 64 * 256
+# Hybrid (marlin mode): above this M the layer is unpacked to per-channel int8
+# (Triton, from the Marlin tile layout) and run on CUTLASS int8_scaled_mm,
+# which beats the Marlin kernel at large M (CMP 170HX: 1.6-1.7x at M=2048; the
+# unpack costs ~0.3 ms per linear, amortised from M~768). 0 disables the path.
+MARLIN_A8_MAX_M = int(os.environ.get("SGLANG_W4A8_MARLIN_MAX_M", "768"))
 # Keep a resident per-channel int8 copy of every weight (+28.7 GB for a 31B
 # model) so the large-M path skips the unpack kernel entirely.
 KEEP_INT8 = os.environ.get("SGLANG_W4A8_KEEP_INT8", "0") == "1"
@@ -232,6 +241,16 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
     def _process_marlin(self, layer: torch.nn.Module, packed: torch.Tensor, s_g: torch.Tensor, N: int, K: int) -> None:
         """packed: GPTQ layout int32 [K/8, N] (uint4b8 = q4 + 8, nibble i of a word = row 8j+i)."""
         dev = packed.device
+        if MARLIN_A8_MAX_M > 0:
+            # per-channel int8 scales for the large-M CUTLASS path (QQQ convention)
+            q4_kn = torch.stack([((packed >> (4 * i)) & 0xF) for i in range(8)], dim=1).reshape(K, N).to(torch.int8) - 8
+            s_ch, s_grp = a8_channel_scales(q4_kn, s_g.t().contiguous(), self.group_size)
+            del q4_kn
+            layer.a8_s_ch_plain = Parameter(s_ch, requires_grad=False)  # fp32 [N]
+            layer.a8_s_grp_plain = Parameter(s_grp, requires_grad=False)  # fp16 [K/g, N]
+        else:
+            layer.a8_s_ch_plain = None
+            layer.a8_s_grp_plain = None
         B = gptq_marlin_repack(packed, torch.empty(0, dtype=torch.int, device=dev), K, N, 4, is_a_8bit=True)
         del packed
         s_perm = marlin_permute_scales(s_g.t().contiguous(), K, N, self.group_size, is_a_8bit=True)  # [K/g, N]
@@ -290,7 +309,11 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         x_2d = x.reshape(-1, K)
         M = x_2d.shape[0]
         x_q, x_s = per_token_quant_int8(x_2d)
-        if W4A8_KERNEL == "marlin":
+        if W4A8_KERNEL == "marlin" and MARLIN_A8_MAX_M > 0 and M > MARLIN_A8_MAX_M:
+            q8 = _scratch("a8_q8", (N, K), torch.int8, x.device)
+            marlin_a8_unpack_to_int8(layer.weight, layer.a8_s_grp_plain, K, N, self.group_size, out=q8)
+            out = int8_scaled_mm(x_q, q8.t(), x_s, layer.a8_s_ch_plain, out_dtype=x.dtype, bias=bias)
+        elif W4A8_KERNEL == "marlin":
             a_scales = x_s.reshape(-1) * layer.marlin_input_global_scale
             sms = torch.cuda.get_device_properties(x.device).multi_processor_count
             c_tmp = _scratch("marlin_c_tmp", (sms * _MARLIN_C_TMP_PER_SM,), torch.float32, x.device)
