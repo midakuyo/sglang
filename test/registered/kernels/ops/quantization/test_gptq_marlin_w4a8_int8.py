@@ -13,6 +13,7 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.marlin_utils import (
+    get_scale_perms,
     marlin_act_int8_process_scales,
     marlin_make_workspace,
 )
@@ -22,8 +23,9 @@ from sglang.test.test_marlin_utils import marlin_quantize
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 GROUP_SIZE = 128
-# small shapes exercise every thread config; the last four are Gemma4 31B
-SHAPES = [(64, 128), (256, 256), (512, 1024), (5376, 16384), (8192, 5376), (5376, 43008), (21504, 5376)]
+# small shapes exercise every thread config; the last four are Gemma4 31B.
+# K == group_size (single group) is not instantiated for int8 (group_blocks -1), so K >= 256.
+SHAPES = [(256, 256), (512, 1024), (5376, 16384), (8192, 5376), (5376, 43008), (21504, 5376)]
 MS = [1, 4, 8, 12, 16, 17, 32, 33, 48, 64, 100, 257, 2048]
 
 
@@ -44,8 +46,9 @@ def _run(size_k, size_n, size_m, dtype, use_fp32_reduce, negative_scales=False):
         b_weight, scalar_types.uint4b8, GROUP_SIZE, False, input_dtype=torch.int8
     )
     if negative_scales:
-        # flip the sign of half the output channels (scale sign carries through)
-        sign = torch.where(torch.arange(size_n, device=device) % 2 == 0, 1.0, -1.0).to(dtype)
+        # flip the sign of every other 32-column block; the int8 scale permutation
+        # only reorders columns inside a 32-block, so the pattern is invariant
+        sign = torch.where((torch.arange(size_n, device=device) // 32) % 2 == 0, 1.0, -1.0).to(dtype)
         marlin_s = marlin_s * sign
         w_ref = w_ref * sign
     x = torch.randn((size_m, size_k), dtype=dtype, device=device)
@@ -64,8 +67,12 @@ def _run(size_k, size_n, size_m, dtype, use_fp32_reduce, negative_scales=False):
     rel_b = (out.float() - ref_b).abs().mean() / ref_b.abs().mean()
     # Ref-A: exact kernel arithmetic. w_ref = (q - 8) * s where s = marlin_s (permuted),
     # kernel uses s16 = round(s / smax * 4096) and out = sum_g P_g * s16[g] * (a_s * smax / 4096)
-    s_orig = marlin_s.float()
-    s16 = s_q.view(torch.int16).float()  # exactly what the kernel reads
+    # marlin_s / s_q are in the kernel's permuted column order; undo it for the reference
+    _, sps = get_scale_perms()
+    inv = torch.argsort(torch.tensor(sps, device=device))
+    unperm = lambda v: v.reshape(-1, len(sps))[:, inv].reshape(-1, size_n)
+    s_orig = unperm(marlin_s).float()
+    s16 = unperm(s_q.view(torch.int16)).float()  # exactly what the kernel reads
     q_signed = (w_ref.float() / s_orig.repeat_interleave(GROUP_SIZE, dim=0)).round()  # (q - 8), exact for our data
     assert q_signed.abs().max() <= 8
     acc = torch.zeros((size_m, size_n), dtype=torch.float64, device=device)
@@ -92,7 +99,10 @@ def test_w4a8_int8_gemm(shape, size_m, use_fp32_reduce):
     print(f"K={size_k} N={size_n} M={size_m} fp32r={use_fp32_reduce}: relB={rel_b:.4f} maxA={max_a:.3e} acc/2^31={headroom:.3f}")
     assert headroom < 1.0, "int32 accumulation overflow"
     assert rel_b < 0.04, f"true-math error {rel_b}"
-    assert ok_a, f"kernel deviates from exact integer emulation, max {max_a}"
+    # the bf16 k-split reduction (use_fp32_reduce=False) rounds partial sums, so
+    # bit-exact agreement with the integer emulation only holds for fp32 reduce
+    if use_fp32_reduce:
+        assert ok_a, f"kernel deviates from exact integer emulation, max {max_a}"
 
 
 def test_w4a8_int8_negative_scales():
