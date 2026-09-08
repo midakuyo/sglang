@@ -311,17 +311,35 @@ def get_scale_perms():
 
 
 def marlin_permute_scales(
-    s: torch.Tensor, size_k: int, size_n: int, group_size: int
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
 ) -> torch.Tensor:
-
+    # The int8-activation kernel (vLLM PR #24722) consumes group scales in the
+    # "single" permutation regardless of group size.
     scale_perm, scale_perm_single = get_scale_perms()
-    if group_size < size_k and group_size != -1:
+    if group_size < size_k and group_size != -1 and not is_a_8bit:
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
     else:
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
     s = s.reshape((-1, size_n)).contiguous()
 
     return s
+
+
+def marlin_act_int8_process_scales(s: torch.Tensor, q: int = 4096):
+    """Quantise Marlin group scales for the int8-activation kernel.
+
+    The kernel folds each group's int32 partial sum with an integer group scale
+    (int16 bits stored in the scale tensor's dtype) and applies the layer-wide
+    factor through the per-token activation scale. Returns (scales viewed as
+    the original dtype, fp32 0-dim factor to multiply the per-token activation
+    scales with). ``q`` is the integer resolution (vLLM uses 4096 = 12 bits;
+    lower it per layer if int32 accumulation headroom is a concern)."""
+    smax = s.float().max()
+    a_scales_scale_factor = (smax / q).reshape(())
+    # quantise in fp32 (vLLM does this in the scale dtype, which for bf16
+    # leaves only ~8 significant bits of the 12-bit grid)
+    s16 = (s.float() / smax * q).round().clamp(-32768, 32767).to(torch.int16)
+    return s16.view(s.dtype), a_scales_scale_factor
 
 
 def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:

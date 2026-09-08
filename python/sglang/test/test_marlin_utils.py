@@ -140,9 +140,11 @@ def marlin_quantize(
     group_size: int,
     act_order: bool,
     test_perm: Optional[torch.Tensor] = None,
+    input_dtype: Optional[torch.dtype] = None,
 ):
     size_k, size_n = w.shape
     num_bits = quant_type.size_bits
+    is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
 
     # Normalize group_size
     if group_size == -1:
@@ -161,9 +163,9 @@ def marlin_quantize(
         q_w, g_idx, sort_indices = sort_weights(q_w, g_idx)
 
     # Reformat to marlin
-    weight_perm = get_weight_perm(num_bits)
-    marlin_q_w = marlin_weights(q_w, size_k, size_n, num_bits, weight_perm)
-    marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
+    weight_perm = get_weight_perm(num_bits, is_a_8bit)
+    marlin_q_w = marlin_weights(q_w, size_k, size_n, num_bits, weight_perm, is_a_8bit=is_a_8bit)
+    marlin_s = marlin_permute_scales(s, size_k, size_n, group_size, is_a_8bit=is_a_8bit)
 
     # Create result
     res_list = [w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, rand_perm]
