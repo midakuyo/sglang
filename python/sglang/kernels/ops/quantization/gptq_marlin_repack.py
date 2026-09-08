@@ -30,7 +30,15 @@ def gptq_marlin_repack(
     size_k: int,
     size_n: int,
     num_bits: int,
+    is_a_8bit: bool = False,
 ) -> torch.Tensor:
+    """Repack a GPTQ row-packed weight [K/pack, N] into the Marlin tile layout.
+
+    is_a_8bit=True emits the 32x32 (k x n) tile layout used by the
+    8-bit-activation (int8/fp8) Marlin kernels; act_order (non-empty perm) is
+    not supported in that mode and size_k must be a multiple of 32.
+    The output shape is the same in both modes: [K/16, N*16/pack].
+    """
     pack_factor = 32 // num_bits
 
     # Allocate output tensor
@@ -41,5 +49,7 @@ def gptq_marlin_repack(
     )
 
     module = _jit_gptq_marlin_repack_module()
-    module.gptq_marlin_repack(b_q_weight, perm, out, size_k, size_n, num_bits)
+    module.gptq_marlin_repack(
+        b_q_weight, perm, out, size_k, size_n, num_bits, is_a_8bit
+    )
     return out
