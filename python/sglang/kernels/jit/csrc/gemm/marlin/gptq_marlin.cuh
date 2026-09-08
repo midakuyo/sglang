@@ -762,7 +762,9 @@ void marlin_mm(
       // every M measured (bench-170hx/marlin_a8_cfg_sweep.py: -17% at M<=16,
       // -8% at M=64, ~-1% at M=2048, int8 and 16-bit activations alike). The
       // lock workspace must hold sms * 2 entries (locks are indexed by block).
-      if (occ2 && thread_tfg.thread_k != -1 && workspace_size >= 2 * sms) {
+      // Above M=512 the gain vanishes (16-bit activations: 2-5% slower at
+      // M=2048 than {64,256,256}), so large prefills keep the vLLM choice.
+      if (occ2 && prob_m <= 512 && thread_tfg.thread_k != -1 && workspace_size >= 2 * sms) {
         thread_config_t occ_cfg{64, 128, 128};
         int group_blocks = 0;
         if (!has_act_order) group_blocks = group_size == -1 ? -1 : group_size / 16;
