@@ -499,7 +499,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             weight_quant.num_bits == 4
             and weight_quant.type == QuantizationType.INT
             and weight_quant.strategy == QuantizationStrategy.GROUP.value
-            and weight_quant.group_size == 128
+            and weight_quant.group_size in (32, 128)
             and weight_quant.symmetric
             and not weight_quant.dynamic
             and input_quant.num_bits == 8
@@ -788,7 +788,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_cuda and self._is_dynamic_token_w4a8_int(weight_quant, input_quant):
                 self._check_scheme_supported(CompressedTensorsW4A8Int8.get_min_capability())
                 return CompressedTensorsW4A8Int8(
-                    group_size=weight_quant.group_size, symmetric=weight_quant.symmetric
+                    group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
+                    packed=quant_format == CompressionFormat.pack_quantized.value,
                 )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
