@@ -39,13 +39,19 @@ class MarlinWorkspace:
         self.scratch = torch.zeros(max_workspace_size, dtype=torch.int, device="cuda")
 
 
-def marlin_permute_weights(q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE):
+def marlin_permute_weights(
+    q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE, is_a_8bit=False
+):
     assert q_w.shape == (size_k, size_n)
     assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
     assert size_n % tile == 0, f"size_k = {size_n}, tile = {tile}"
 
-    # Permute weights to 16x64 marlin tiles
-    q_w = q_w.reshape((size_k // tile, tile, size_n // tile, tile))
+    if is_a_8bit:
+        # Permute weights to 32x32 marlin tiles
+        q_w = q_w.reshape((size_k // (tile * 2), tile * 2, size_n // tile, tile))
+    else:
+        # Permute weights to 16x64 marlin tiles
+        q_w = q_w.reshape((size_k // tile, tile, size_n // tile, tile))
     q_w = q_w.permute((0, 2, 1, 3))
     q_w = q_w.reshape((size_k // tile, size_n * tile))
 
@@ -54,9 +60,9 @@ def marlin_permute_weights(q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE):
     return q_w
 
 
-def marlin_weights(q_w, size_k, size_n, num_bits, perm):
+def marlin_weights(q_w, size_k, size_n, num_bits, perm, is_a_8bit=False):
     # Permute
-    q_w = marlin_permute_weights(q_w, size_k, size_n, perm)
+    q_w = marlin_permute_weights(q_w, size_k, size_n, perm, is_a_8bit=is_a_8bit)
 
     # Pack
     pack_factor = get_pack_factor(num_bits)
@@ -73,28 +79,53 @@ def marlin_weights(q_w, size_k, size_n, num_bits, perm):
     return q_packed
 
 
-def get_weight_perm(num_bits: int):
+def get_weight_perm(num_bits: int, is_a_8bit: bool = False):
     perm_list: list[int] = []
-    for i in range(32):
-        perm1: list[int] = []
-        col = i // 4
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
-            perm_list.extend([p + 256 * j for p in perm1])
+    if is_a_8bit:
+        for i in range(32):
+            perm1: list[int] = []
+            col = i // 4
+            for block in [0, 1]:
+                for row in [
+                    4 * (i % 4),
+                    4 * (i % 4) + 1,
+                    4 * (i % 4) + 2,
+                    4 * (i % 4) + 3,
+                    4 * (i % 4 + 4),
+                    4 * (i % 4 + 4) + 1,
+                    4 * (i % 4 + 4) + 2,
+                    4 * (i % 4 + 4) + 3,
+                ]:
+                    perm1.append(16 * row + col + 8 * block)
+            for j in range(2):
+                perm_list.extend([p + 512 * j for p in perm1])
+    else:
+        for i in range(32):
+            perm1: list[int] = []
+            col = i // 4
+            for block in [0, 1]:
+                for row in [
+                    2 * (i % 4),
+                    2 * (i % 4) + 1,
+                    2 * (i % 4 + 4),
+                    2 * (i % 4 + 4) + 1,
+                ]:
+                    perm1.append(16 * row + col + 8 * block)
+            for j in range(4):
+                perm_list.extend([p + 256 * j for p in perm1])
 
     perm = np.array(perm_list)
 
     if num_bits == 4:
-        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+        if is_a_8bit:
+            interleave = np.array([0, 4, 1, 5, 2, 6, 3, 7])
+        else:
+            interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
     elif num_bits == 8:
-        interleave = np.array([0, 2, 1, 3])
+        if is_a_8bit:
+            interleave = np.array([0, 1, 2, 3])
+        else:
+            interleave = np.array([0, 2, 1, 3])
     else:
         raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
 
