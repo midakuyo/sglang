@@ -477,6 +477,7 @@ MarlinFuncPtr get_marlin_kernel(
     if (false) {
     }
     A8_GET_IF(host::kU4B8, 8)
+    A8_GET_IF(host::kU4B8, 2)  // group 32 (Google QAT w4a16-ct checkpoints)
   } else {
     static_assert(std::is_same_v<a_scalar_t, c_scalar_t>, "16-bit activations must match the output dtype");
     if (false) {

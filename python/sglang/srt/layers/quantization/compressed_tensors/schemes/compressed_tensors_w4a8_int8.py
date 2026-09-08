@@ -30,7 +30,11 @@ from sglang.kernels.ops.quantization.marlin_qqq import (
     qqq_pack_from_int4,
     qqq_unpack_to_int8_triton,
 )
-from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
+from sglang.srt.layers.parameter import (
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
+    PackedvLLMParameter,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
@@ -167,10 +171,16 @@ PREFETCH_UNPACK = os.environ.get("SGLANG_W4A8_PREFETCH_UNPACK", "0") == "1"
 
 
 class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
-    def __init__(self, group_size: int, symmetric: bool = True):
-        assert group_size == 128, "Marlin-QQQ supports group_size 128 only"
+    def __init__(self, group_size: int, symmetric: bool = True, packed: bool = False):
+        assert group_size in (32, 128), f"unsupported group_size {group_size}"
         assert symmetric, "asymmetric int4 weights are not supported"
+        if W4A8_KERNEL == "qqq":
+            assert group_size == 128, "Marlin-QQQ supports group_size 128 only (use SGLANG_W4A8_KERNEL=marlin)"
         self.group_size = group_size
+        # compressed-tensors "pack-quantized": weight_packed int32 [N, K/8]
+        # (uint4b8 nibbles along K, as in GPTQ) instead of an int8 [N, K] tensor
+        # ("int-quantized"). Google's QAT w4a16-ct checkpoints are packed.
+        self.packed = packed
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -188,13 +198,25 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
         assert input_size_per_partition % self.group_size == 0
-        weight = ModelWeightParameter(
-            data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=torch.int8),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+        if self.packed:
+            assert input_size_per_partition % 8 == 0
+            weight = PackedvLLMParameter(
+                data=torch.empty(output_size_per_partition, input_size_per_partition // 8, dtype=torch.int32),
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=8,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_packed", weight)
+        else:
+            weight = ModelWeightParameter(
+                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=torch.int8),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 output_size_per_partition,
@@ -207,14 +229,9 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
-    def _process_marlin(self, layer: torch.nn.Module, q4: torch.Tensor, s_g: torch.Tensor) -> None:
-        N, K = q4.shape
-        dev = q4.device
-        # GPTQ layout: uint4b8 (= q4 + 8) packed 8-per-int32 along K -> repack to
-        # the int8-activation tile layout
-        w_u = (q4.to(torch.int32) + 8).t().contiguous()  # [K, N]
-        packed = pack_rows_uint4(w_u)  # int32 [K/8, N]
-        del w_u
+    def _process_marlin(self, layer: torch.nn.Module, packed: torch.Tensor, s_g: torch.Tensor, N: int, K: int) -> None:
+        """packed: GPTQ layout int32 [K/8, N] (uint4b8 = q4 + 8, nibble i of a word = row 8j+i)."""
+        dev = packed.device
         B = gptq_marlin_repack(packed, torch.empty(0, dtype=torch.int, device=dev), K, N, 4, is_a_8bit=True)
         del packed
         s_perm = marlin_permute_scales(s_g.t().contiguous(), K, N, self.group_size, is_a_8bit=True)  # [K/g, N]
@@ -228,12 +245,23 @@ class CompressedTensorsW4A8Int8(CompressedTensorsLinearScheme):
         torch.cuda.empty_cache()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        q4 = layer.weight.data  # int8 [N, K], values in [-8, 7]
         s_g = layer.weight_scale.data  # [N, K/g]
-        if W4A8_KERNEL == "marlin":
-            self._process_marlin(layer, q4, s_g)
+        if self.packed:
+            wp = layer.weight_packed.data  # int32 [N, K/8]
+            N, K = wp.shape[0], wp.shape[1] * 8
+            assert W4A8_KERNEL == "marlin", "packed W4A8 checkpoints need SGLANG_W4A8_KERNEL=marlin"
+            packed = wp.t().contiguous()  # [K/8, N], same nibble order as pack_rows_uint4
+            del layer.weight_packed
+            self._process_marlin(layer, packed, s_g, N, K)
             return
+        q4 = layer.weight.data  # int8 [N, K], values in [-8, 7]
         N, K = q4.shape
+        if W4A8_KERNEL == "marlin":
+            w_u = (q4.to(torch.int32) + 8).t().contiguous()  # [K, N] uint4b8
+            packed = pack_rows_uint4(w_u)  # int32 [K/8, N]
+            del w_u
+            self._process_marlin(layer, packed, s_g, N, K)
+            return
         B, s_ch_p, s_grp_p, q8, s_ch, s_grp = qqq_pack_from_int4(q4, s_g, self.group_size)
         if KEEP_INT8:
             layer.qqq_q8 = Parameter(q8.t().contiguous(), requires_grad=False)  # int8 [N, K]

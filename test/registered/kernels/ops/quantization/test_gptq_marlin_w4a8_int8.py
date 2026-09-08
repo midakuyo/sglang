@@ -38,12 +38,12 @@ def _pack_rows_uint4b8(q_w):
     return packed
 
 
-def _run(size_k, size_n, size_m, dtype, use_fp32_reduce, negative_scales=False):
+def _run(size_k, size_n, size_m, dtype, use_fp32_reduce, negative_scales=False, group_size=GROUP_SIZE):
     device = "cuda"
     torch.manual_seed(size_k * 7 + size_n * 3 + size_m)
     b_weight = torch.randn((size_k, size_n), dtype=dtype, device=device) * 0.02
     w_ref, marlin_q_w, marlin_s, _, _, _ = marlin_quantize(
-        b_weight, scalar_types.uint4b8, GROUP_SIZE, False, input_dtype=torch.int8
+        b_weight, scalar_types.uint4b8, group_size, False, input_dtype=torch.int8
     )
     if negative_scales:
         # flip the sign of every other 32-column block; the int8 scale permutation
@@ -73,11 +73,11 @@ def _run(size_k, size_n, size_m, dtype, use_fp32_reduce, negative_scales=False):
     unperm = lambda v: v.reshape(-1, len(sps))[:, inv].reshape(-1, size_n)
     s_orig = unperm(marlin_s).float()
     s16 = unperm(s_q.view(torch.int16)).float()  # exactly what the kernel reads
-    q_signed = (w_ref.float() / s_orig.repeat_interleave(GROUP_SIZE, dim=0)).round()  # (q - 8), exact for our data
+    q_signed = (w_ref.float() / s_orig.repeat_interleave(group_size, dim=0)).round()  # (q - 8), exact for our data
     assert q_signed.abs().max() <= 8
     acc = torch.zeros((size_m, size_n), dtype=torch.float64, device=device)
-    for g in range(size_k // GROUP_SIZE):
-        sl = slice(g * GROUP_SIZE, (g + 1) * GROUP_SIZE)
+    for g in range(size_k // group_size):
+        sl = slice(g * group_size, (g + 1) * group_size)
         p_g = a_q[:, sl].to(torch.float64) @ q_signed[sl, :].to(torch.float64)  # exact int
         acc += p_g * s16[g].to(torch.float64)[None, :]
     headroom = acc.abs().max().item() / 2**31
@@ -113,3 +113,15 @@ def test_w4a8_int8_negative_scales():
 def test_w4a8_int8_fp16_output():
     rel_b, ok_a, max_a, headroom = _run(512, 1024, 17, torch.float16, True)
     assert rel_b < 0.04 and ok_a
+
+
+@pytest.mark.parametrize("shape", [(512, 1024), (5376, 16384), (21504, 5376)])
+@pytest.mark.parametrize("size_m", [1, 12, 33, 64, 2048])
+def test_w4a8_int8_gemm_group32(shape, size_m):
+    """Google QAT w4a16-ct checkpoints use group_size 32 (group_blocks 2)."""
+    size_k, size_n = shape
+    rel_b, ok_a, max_a, headroom = _run(size_k, size_n, size_m, torch.bfloat16, True, group_size=32)
+    print(f"g32 K={size_k} N={size_n} M={size_m}: relB={rel_b:.4f} maxA={max_a:.3e} acc/2^31={headroom:.3f}")
+    assert headroom < 1.0, "int32 accumulation overflow"
+    assert rel_b < 0.04, f"true-math error {rel_b}"
+    assert ok_a, f"kernel deviates from exact integer emulation, max {max_a}"
