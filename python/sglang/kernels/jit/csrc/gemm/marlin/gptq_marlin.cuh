@@ -20,6 +20,8 @@
  */
 
 #pragma once
+#include <cstdio>
+#include <cstdlib>
 
 #include <sgl_kernel/tensor.h>
 
@@ -594,6 +596,7 @@ void marlin_mm(
     int prob_k,
     int lda,
     void* workspace,
+    int workspace_size,
     host::ScalarType const& a_type,
     host::ScalarType const& b_type,
     host::ScalarType const& c_type,
@@ -608,6 +611,10 @@ void marlin_mm(
     cudaStream_t stream,
     int thread_k_init,
     int thread_n_init,
+    int threads_init,
+    int bps_init,
+    bool marlin_debug,
+    bool occ2,
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
@@ -696,8 +703,11 @@ void marlin_mm(
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
     if (thread_k != -1 && thread_n != -1) {
-      thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
-      exec_cfg = exec_config_t{1, thread_tfg};
+      thread_tfg = thread_config_t{thread_k, thread_n, threads_init > 0 ? threads_init : default_threads};
+      exec_cfg = exec_config_t{bps_init > 0 ? bps_init : 1, thread_tfg};
+      host::RuntimeCheck(
+          workspace_size >= sms * exec_cfg.blocks_per_sm,
+          "SGLANG_MARLIN_CFG blocks_per_sm needs workspace >= sms * blocks_per_sm");
       host::RuntimeCheck(prob_n % thread_n == 0, "prob_n = ", prob_n, " is not divisible by thread_n = ", thread_n);
       host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
     } else {
@@ -747,6 +757,49 @@ void marlin_mm(
         }
       }
 
+      // Occupancy 2: on parts with few SMs (CMP 170HX: 70) two 128-thread
+      // {thread_k 64, thread_n 128} blocks per SM beat one 256-thread block at
+      // every M measured (bench-170hx/marlin_a8_cfg_sweep.py: -17% at M<=16,
+      // -8% at M=64, ~-1% at M=2048, int8 and 16-bit activations alike). The
+      // lock workspace must hold sms * 2 entries (locks are indexed by block).
+      if (occ2 && thread_tfg.thread_k != -1 && workspace_size >= 2 * sms) {
+        thread_config_t occ_cfg{64, 128, 128};
+        int group_blocks = 0;
+        if (!has_act_order) group_blocks = group_size == -1 ? -1 : group_size / 16;
+        if (is_valid_config(
+                occ_cfg,
+                thread_m_blocks,
+                prob_m_split,
+                prob_n,
+                prob_k,
+                num_bits,
+                group_size,
+                has_act_order,
+                is_k_full,
+                has_zp,
+                is_zp_float,
+                is_a_8bit,
+                stages,
+                max_shared_mem / 2 - 1024) &&
+            get_marlin_kernel<a_scalar_t, c_scalar_t>(
+                a_type,
+                b_type,
+                c_type,
+                s_type,
+                thread_m_blocks,
+                occ_cfg.thread_n / 16,
+                occ_cfg.thread_k / 16,
+                m_block_size_8,
+                has_act_order,
+                has_zp,
+                group_blocks,
+                occ_cfg.num_threads,
+                is_zp_float) != MarlinDefault) {
+          thread_tfg = occ_cfg;
+          exec_cfg = {2, thread_tfg};
+        }
+      }
+
       if (thread_tfg.thread_k == -1 && max_thread_m_blocks > 1) {
         max_thread_m_blocks--;
         continue;
@@ -757,6 +810,12 @@ void marlin_mm(
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
     int blocks = sms * exec_cfg.blocks_per_sm;
+    if (marlin_debug) {
+      std::printf(
+          "[marlin] M=%d (split %d, m_blocks %d, m8 %d) N=%d K=%d a8=%d -> thread_k %d thread_n %d threads %d bps %d blocks %d\n",
+          prob_m, prob_m_split, thread_m_blocks, m_block_size_8, prob_n, prob_k, (int)is_a_8bit,
+          thread_k, thread_n, num_threads, exec_cfg.blocks_per_sm, blocks);
+    }
     if (exec_cfg.blocks_per_sm > 1) max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
     int thread_k_blocks = thread_k / 16;
@@ -1099,8 +1158,26 @@ void gptq_marlin_gemm(
       workspace.size(0) >= sms, "workspace.size(0) = ", workspace.size(0), " is below min_workspace_size = ", sms);
 
   // Hardcoded defaults (auto config)
+  // Debug/tuning override: SGLANG_MARLIN_CFG="thread_k,thread_n,num_threads"
+  // (e.g. 64,128,128) forces a thread config for every call; unset = auto.
   int thread_k_init = -1;
   int thread_n_init = -1;
+  int threads_init = -1;
+  int bps_init = -1;  // blocks per SM for the forced config (optional 4th field)
+  if (const char* cfg = std::getenv("SGLANG_MARLIN_CFG")) {
+    int k = -1, n = -1, t = -1, b = -1;
+    int got = std::sscanf(cfg, "%d,%d,%d,%d", &k, &n, &t, &b);
+    if (got >= 3) {
+      thread_k_init = k;
+      thread_n_init = n;
+      threads_init = t;
+      if (got == 4) bps_init = b;
+    }
+  }
+  const bool marlin_debug = std::getenv("SGLANG_MARLIN_DEBUG") != nullptr;
+  // Occupancy-2 heuristic (default on): SGLANG_MARLIN_OCC2=0 restores the vLLM choice.
+  const char* occ2_env = std::getenv("SGLANG_MARLIN_OCC2");
+  const bool occ2 = !(occ2_env && occ2_env[0] == '0');
 
   // Compute c_tmp and a_tmp pointers
   // c_tmp and a_tmp are pre-allocated by caller
@@ -1123,6 +1200,7 @@ void gptq_marlin_gemm(
       static_cast<int>(size_k),
       static_cast<int>(a_stride0),
       workspace.data_ptr(),
+      (int)workspace.size(0),
       a_type,
       b_q_type,
       c_type,
@@ -1137,6 +1215,10 @@ void gptq_marlin_gemm(
       stream,
       thread_k_init,
       thread_n_init,
+      threads_init,
+      bps_init,
+      marlin_debug,
+      occ2,
       sms,
       use_atomic_add,
       use_fp32_reduce,

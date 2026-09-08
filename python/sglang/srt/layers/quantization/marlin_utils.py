@@ -266,10 +266,12 @@ def check_moe_marlin_supports_layer(
 
 
 def marlin_make_workspace(
-    device: torch.device, max_blocks_per_sm: int = 1
+    device: torch.device, max_blocks_per_sm: int = 2
 ) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
-    # size. The num of threadblocks is sms_count * max_blocks_per_sm.
+    # size. The num of threadblocks is sms_count * max_blocks_per_sm. The
+    # fork's occupancy-2 heuristic (gptq_marlin.cuh) launches 2 blocks per SM
+    # whenever the workspace allows it, so default to 2.
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(
         sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
