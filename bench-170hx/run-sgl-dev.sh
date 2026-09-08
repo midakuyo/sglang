@@ -3,11 +3,12 @@
 # 순수 Python/Triton 변경은 이미지 재빌드 없이 이 스크립트 재실행만으로 반영.
 # GPU1(블로워) 고정. device_timer + /metrics 로 verify/draft GPU 시간 분리 계측.
 IMG=sglang-overlay:50c1bf0
+SRC=${SRC:-/home/midakuyo/sglang}
 MODEL=${MODEL:-/models/gemma4-lokesh-int8}
 docker rm -f sgl-dev sgl-dev-prev 2>/dev/null
 docker run -d --device nvidia.com/gpu=1 -p 8001:8000 --name sgl-dev \
   -v /home/midakuyo/data/models:/models \
-  -v /home/midakuyo/sglang/python/sglang:/src/python/sglang:ro \
+  -v $SRC/python/sglang:/src/python/sglang:ro \
   -v /home/midakuyo/triton-cache:/root/.cache/sglang \
   -e SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=${FREE:-1} \
   -e SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 -e SGLANG_DEVICE_TIMER_LAYER_GROUPS=${LG:-0} -e SGLANG_DEVICE_TIMER_LAYER_GROUPS_LOG=${LGLOG:-0} -e SGLANG_PROBE_ATTN_ABLATE=${ABL:-} -e SGLANG_IN_BATCH_PREFIX_HOLD_THRESHOLD=${HOLD:-0} -e SGLANG_W4A8_KEEP_INT8=${KEEP8:-0} -e SGLANG_W4A8_KERNEL=${W4A8:-marlin} -e SGLANG_MARLIN_OCC2=${OCC2:-1} \
@@ -18,4 +19,4 @@ docker run -d --device nvidia.com/gpu=1 -p 8001:8000 --name sgl-dev \
   --speculative-algorithm NEXTN \
   --speculative-draft-model-path /models/gemma4-31b-assistant \
   --speculative-num-steps 2 --speculative-num-draft-tokens 3 --speculative-eagle-topk 1 "$@"
-echo "sgl-dev (fork ~/sglang $(git -C ~/sglang rev-parse --short HEAD), GPU1) :8001"
+echo "sgl-dev (fork ~/sglang $(git -C $SRC rev-parse --short HEAD), GPU1) :8001"
