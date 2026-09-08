@@ -3,6 +3,7 @@
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import os
 from typing import Callable, Optional
 
 import torch
@@ -44,7 +45,33 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
+    from sgl_kernel import int8_scaled_mm
+
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+    from sglang.kernels.ops.quantization.marlin_a8_unpack import (
+        a8_channel_scales,
+        marlin_w4a16_unpack_to_int8,
+        unpack_uint4b8_rows,
+    )
+
+# Hybrid prefill for 4-bit symmetric group weights (e.g. Google QAT w4a16-ct):
+# above this M the layer is unpacked from the Marlin tile layout to per-channel
+# int8 and run on CUTLASS int8_scaled_mm with per-token int8 activations
+# (CMP 170HX: W4A16 Marlin prefill 1.5k tok/s -> ~2.9k). Decode / verify (small
+# M) stays on the exact bf16-activation Marlin path. 0 disables.
+W4A16_INT8_PREFILL_MAX_M = int(os.environ.get("SGLANG_W4A16_INT8_PREFILL_MAX_M", "768"))
+_HYB_SCRATCH: dict = {}
+
+
+def _hyb_scratch(shape, dtype, device) -> torch.Tensor:
+    k = (dtype, str(device))
+    numel = shape[0] * shape[1]
+    tsr = _HYB_SCRATCH.get(k)
+    if tsr is None or tsr.numel() < numel:
+        tsr = torch.empty(numel, dtype=dtype, device=device)
+        _HYB_SCRATCH[k] = tsr
+    return tsr[:numel].view(*shape)
 
 
 ScalarType, scalar_types = get_scalar_types()
@@ -231,6 +258,26 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         # Allocate marlin workspace.
         self.workspace = marlin_make_workspace(device)
 
+        # Hybrid int8 prefill: per-channel int8 scales derived from the plain
+        # packed weights (before the Marlin repack below).
+        self.hybrid = (
+            _is_cuda
+            and W4A16_INT8_PREFILL_MAX_M > 0
+            and c.weight_type.size_bits == 4
+            and self.symmetric
+            and not c.has_g_idx
+            and c.group_size in (32, 128)
+            and c.partition_weight_shape[1] % 128 == 0
+            and c.partition_weight_shape[0] % 32 == 0
+        )
+        if self.hybrid:
+            q4_kn = unpack_uint4b8_rows(getattr(layer, self.w_q_name).data)  # int8 [K, N]
+            s_g_kn = getattr(layer, self.w_s_name).data.t().contiguous()  # [K/g, N]
+            s_ch, s_grp = a8_channel_scales(q4_kn, s_g_kn, c.group_size)
+            del q4_kn
+            layer.hyb_s_ch = torch.nn.Parameter(s_ch, requires_grad=False)  # fp32 [N]
+            layer.hyb_s_grp = torch.nn.Parameter(s_grp, requires_grad=False)  # fp16 [K/g, N]
+
         def _transform_param(
             layer: torch.nn.Module, name: Optional[str], fn: Callable
         ) -> None:
@@ -321,6 +368,15 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+
+        K, N = c.partition_weight_shape
+        if getattr(self, "hybrid", False) and x.numel() // K > W4A16_INT8_PREFILL_MAX_M:
+            x_2d = x.reshape(-1, K)
+            x_q, x_s = per_token_quant_int8(x_2d)
+            q8 = _hyb_scratch((N, K), torch.int8, x.device)
+            marlin_w4a16_unpack_to_int8(w_q, layer.hyb_s_grp, K, N, c.group_size, out=q8)
+            out = int8_scaled_mm(x_q, q8.t(), x_s, layer.hyb_s_ch, out_dtype=x.dtype, bias=bias)
+            return out.reshape(*x.shape[:-1], N)
 
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
         #  None for marlin

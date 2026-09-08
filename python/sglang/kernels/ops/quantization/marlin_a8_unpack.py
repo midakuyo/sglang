@@ -77,6 +77,69 @@ def marlin_a8_unpack_to_int8(
     return out
 
 
+@triton.jit
+def _w4a16_unpack_kernel(b_ptr, s_ptr, out_ptr, N, K, stride_sk, GROUP: tl.constexpr, NB: tl.constexpr):
+    """16-bit-activation Marlin layout (is_a_8bit=False, 4-bit): chunks of 16
+    k-rows x 64 n-cols (128 words); source (row, nn) -> word
+    q = 4 * (4 * col + (row % 8) // 2) + nn // 16 with col = (nn % 16) % 8,
+    t = 4 * ((nn % 16) // 8) + (row % 2) + 2 * (row // 8), nibble
+    e = t / 2 (t even) or 4 + (t - 1) / 2 (t odd). Verified in
+    bench-170hx/w4a16_layout_check.py."""
+    kb = tl.program_id(0)  # 16-row k block
+    nb = tl.program_id(1)  # NB chunks of 64 columns
+    row = tl.arange(0, 16)
+    nn = tl.arange(0, 64 * NB)
+    n = nb * (64 * NB) + nn
+    k = kb * 16 + row
+    m = n // 64
+    c16 = (nn % 64) % 16
+    col = c16 % 8
+    block = c16 // 8
+    j = (nn % 64) // 16
+    i = 4 * col[None, :] + (row[:, None] % 8) // 2  # [16, 64NB]
+    q = 4 * i + j[None, :]
+    t = 4 * block[None, :] + (row[:, None] % 2) + 2 * (row[:, None] // 8)
+    e = tl.where(t % 2 == 0, t // 2, 4 + (t - 1) // 2)
+    chunk = kb * (N // 64) + m[None, :]
+    word = 128 * chunk + q
+    w = tl.load(b_ptr + word)
+    v = (w >> (4 * e)) & 0xF
+    g = k // GROUP
+    sc = tl.load(s_ptr + g[:, None] * stride_sk + n[None, :])  # fp16 [16, 64NB]
+    q8 = libdevice.rint(((v - 8).to(tl.float16) * sc).to(tl.float32))
+    q8 = tl.minimum(tl.maximum(q8, -128.0), 127.0)
+    tl.store(out_ptr + n[None, :] * K + k[:, None], q8.to(tl.int8))
+
+
+def marlin_w4a16_unpack_to_int8(
+    b_q_weight: torch.Tensor,
+    s_group: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """b_q_weight: Marlin (16-bit activation) repacked int32 [K/16, 2N] of 4-bit
+    uint4b8 weights; s_group fp16 [K/g, N]. Returns per-channel int8 [N, K]."""
+    assert size_k % 16 == 0 and size_n % 128 == 0 and size_k % group_size == 0
+    assert b_q_weight.is_contiguous() and s_group.is_contiguous() and s_group.dtype == torch.float16
+    if out is None:
+        out = torch.empty((size_n, size_k), dtype=torch.int8, device=b_q_weight.device)
+    NB = 2  # 128 columns per program
+    _w4a16_unpack_kernel[(size_k // 16, size_n // (64 * NB))](
+        b_q_weight, s_group, out, size_n, size_k, s_group.stride(0), GROUP=group_size, NB=NB, num_warps=4
+    )
+    return out
+
+
+def unpack_uint4b8_rows(weight_packed_nk: torch.Tensor) -> torch.Tensor:
+    """compressed-tensors / GPTQ row packing int32 [N, K/8] (nibble i of word j =
+    k = 8j + i, uint4b8) -> signed int4 values as int8 [K, N]."""
+    N = weight_packed_nk.shape[0]
+    q = torch.stack([((weight_packed_nk >> (4 * i)) & 0xF) for i in range(8)], dim=-1).reshape(N, -1)
+    return (q.to(torch.int8) - 8).t().contiguous()
+
+
 def a8_channel_scales(q4_kn: torch.Tensor, s_g_kn: torch.Tensor, group_size: int):
     """q4_kn: int8/int32 [K, N] signed int4 values; s_g_kn: [K/g, N] group scales.
     Returns (s_channel fp32 [N], s_group fp16 [K/g, N]) in the QQQ convention."""
